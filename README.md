@@ -1,41 +1,78 @@
 # Codex Usage
 
-A standalone desktop app for managing local Codex accounts, usage snapshots, and account switching.
+[![CI](https://github.com/hackerpl/codex-usage/actions/workflows/ci.yml/badge.svg)](https://github.com/hackerpl/codex-usage/actions/workflows/ci.yml)
+[![Release](https://github.com/hackerpl/codex-usage/actions/workflows/release.yml/badge.svg)](https://github.com/hackerpl/codex-usage/actions/workflows/release.yml)
 
-## Current scope
+Codex Usage is a standalone Tauri desktop app for viewing local Codex account usage, switching accounts, and managing auto-switch behavior from a tray-style GUI.
 
-- `M1` desktop UI with a reference-style account popover
-- Reads and writes `~/.codex/accounts/registry.json`
-- Launches native `codex login` from the GUI to add accounts
-- Supports local account switching through Tauri commands
-- Owns its own Linux auto-switch timer: `codex-usage-autoswitch.timer`
-- Can run manual and scheduled auto-switch checks without `codex-auth`
-- Falls back to mock data when running outside Tauri
+## What It Does
 
-## Run
+- Reads real local Codex state from `~/.codex`
+- Shows current account, 5h usage, and weekly usage
+- Switches accounts by rewriting local `auth.json` and registry state
+- Starts native `codex login` directly from the GUI to add accounts
+- Runs as a tray app with a menu-like popover window
+- Installs and manages its own Linux user timer: `codex-usage-autoswitch.timer`
+- Refreshes automatically when local Codex files change
+
+## Download
+
+- Latest builds: [GitHub Releases](https://github.com/hackerpl/codex-usage/releases)
+
+## Requirements
+
+- Node.js 20+
+- Rust stable toolchain
+- A local Codex CLI install with access to `~/.codex`
+
+## Local Development
+
+Install dependencies:
 
 ```bash
 npm install
+```
+
+Run the web preview:
+
+```bash
 npm run dev
 ```
 
-For the desktop app:
+Run the desktop app:
 
 ```bash
 npm run tauri:dev
 ```
 
-For the compiled desktop binary:
+Create a production build:
+
+```bash
+npm run build
+npm run tauri:build
+```
+
+Run the compiled binary directly:
 
 ```bash
 ./scripts/desktop-env.sh src-tauri/target/release/codex-usage
 ```
 
-## Auto switch service
+## Ubuntu Setup
+
+For Ubuntu 24.04, bootstrap the machine with:
+
+```bash
+./scripts/setup-ubuntu.sh
+```
+
+That script installs the Linux Tauri system libraries, Rust via `rustup`, and the project npm dependencies.
+
+## Auto Switch Service
 
 The GUI `Settings` panel can install, start, stop, uninstall, and manually run the background auto-switch check on Linux.
 
-The same actions are also available from the binary:
+The same actions are available from the binary:
 
 ```bash
 ./scripts/desktop-env.sh src-tauri/target/debug/codex-usage --auto-switch-check
@@ -45,20 +82,13 @@ The same actions are also available from the binary:
 ./scripts/desktop-env.sh src-tauri/target/debug/codex-usage --uninstall-auto-switch-service
 ```
 
-## Environment note
+## Release Process
 
-This repo expects a Rust toolchain for Tauri (`rustc`, `cargo`) and Node.js.
-
-## Ubuntu setup
-
-For Ubuntu 24.04, you can bootstrap the machine with:
+Push a version tag to trigger the release workflow:
 
 ```bash
-./scripts/setup-ubuntu.sh
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
-That script installs:
-
-- Tauri system libraries
-- Rust via `rustup`
-- project npm dependencies
+The GitHub Actions release workflow builds desktop bundles for Linux, macOS, and Windows and uploads them to the matching GitHub Release.

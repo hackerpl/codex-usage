@@ -17,3 +17,10 @@ yarn-error.log*
 pnpm-debug.log*
 
 *.orig
+
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/64x64.png
+src-tauri/icons/icon-1024.png
+src-tauri/icons/StoreLogo.png
+src-tauri/icons/Square*.png

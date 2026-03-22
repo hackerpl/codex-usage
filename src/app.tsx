@@ -11,6 +11,7 @@ import {
   maskEmail,
   planTone,
 } from "./lib/format";
+import type { Lang } from "./lib/format";
 import {
   getAppSnapshot,
   launchAddAccountLogin,
@@ -44,6 +45,9 @@ export function App() {
   const [serviceActionMessage, setServiceActionMessage] = useState<string | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<SettingsUpdate | null>(null);
   const queuedRefreshTimer = useRef<number | null>(null);
+
+  const [lang, setLang] = useState<Lang>("zh");
+  const t = (en: string, zh: string) => lang === "zh" ? zh : en;
 
   useEffect(() => {
     void refresh(true);
@@ -226,7 +230,7 @@ export function App() {
         <header className="topbar">
           <div className="topbar-copy" data-tauri-drag-region>
             <h1>Codex</h1>
-            <p>{snapshot ? formatUpdatedAt(snapshot.lastUpdatedAt) : "Loading local state..."}</p>
+            <p>{snapshot ? formatUpdatedAt(snapshot.lastUpdatedAt, lang) : t("Loading local state...", "正在载入本地状态...")}</p>
           </div>
           <button
             type="button"
@@ -248,7 +252,7 @@ export function App() {
 
           {isLoading || !snapshot ? (
             <section className="empty-state">
-              <p>Reading local Codex data...</p>
+              <p>{t("Reading local Codex data...", "正在读取本地用量信息...")}</p>
             </section>
           ) : (
             <>
@@ -256,7 +260,7 @@ export function App() {
                 <div className="hero-header">
                   <div>
                     <div className="hero-email">
-                      {current ? maskEmail(current.email, showEmails) : "No active account"}
+                      {current ? maskEmail(current.email, showEmails) : t("No active account", "无激活用量")}
                     </div>
                     <div className="hero-caption">
                       {current ? current.accountKey : snapshot.registryPath}
@@ -267,17 +271,17 @@ export function App() {
                   ) : null}
                 </div>
 
-                <UsageSection title="5 Hours" window={current?.usage5h ?? null} />
-                <UsageSection title="Weekly" window={current?.usageWeekly ?? null} />
+                <UsageSection title={t("5 Hours", "近5小时用量")} window={current?.usage5h ?? null} lang={lang} />
+                <UsageSection title={t("Weekly", "近7天用量")} window={current?.usageWeekly ?? null} lang={lang} />
               </section>
 
               <section className="account-list">
                 <div className="section-title">
-                  <span>Switch Account</span>
-                  <span className="section-meta">{accountCount} tracked</span>
+                  <span>{t("Switch Account", "切换账号")}</span>
+                  <span className="section-meta">{accountCount} {t("tracked", "个账号")}</span>
                 </div>
                 {snapshot.otherAccounts.length === 0 ? (
-                  <div className="empty-inline">No alternate accounts in the registry yet.</div>
+                  <div className="empty-inline">{t("No alternate accounts in the registry yet.", "登记簿中暂无可以切换的其他账号。")}</div>
                 ) : (
                   snapshot.otherAccounts.map((account) => (
                     <button
@@ -302,24 +306,29 @@ export function App() {
 
               <section className="actions">
                 <ActionButton
-                  label="Add Account"
-                  detail="Start Codex sign-in"
+                  label={t("Add Account", "添加新账号")}
+                  detail={t("Start Codex sign-in", "唤起 Codex 登录终端")}
                   onClick={openAddAccountPanel}
                 />
                 <ActionButton
-                  label={showEmails ? "Hide Emails" : "Show Emails"}
-                  detail={showEmails ? "Mask local parts" : "Reveal local parts"}
+                  label={showEmails ? t("Hide Emails", "隐藏完整邮箱") : t("Show Emails", "显示完整邮箱")}
+                  detail={showEmails ? t("Mask local parts", "默认隐藏前缀") : t("Reveal local parts", "在列表中完整发散")}
                   onClick={() => setShowEmails((value) => !value)}
                 />
                 <ActionButton
-                  label="Status Page"
-                  detail={`${formatServiceRuntime(snapshot.serviceRuntime)} · ${formatUsageSource(snapshot.usageSource)}`}
+                  label={t("Status Page", "查看状态详情")}
+                  detail={`${formatServiceRuntime(snapshot.serviceRuntime, lang)} · ${formatUsageSource(snapshot.usageSource, lang)}`}
                   onClick={() => setPanelMode("status")}
                 />
                 <ActionButton
-                  label="Settings"
-                  detail={`Auto ${snapshot.autoSwitch.enabled ? "on" : "off"}`}
+                  label={t("Settings", "偏好设置")}
+                  detail={t(`Auto switch ${snapshot.autoSwitch.enabled ? "on" : "off"}`, `自动切换开关：${snapshot.autoSwitch.enabled ? "开" : "关"}`)}
                   onClick={openSettingsPanel}
+                />
+                <ActionButton
+                  label={t("Switch Language", "语言 / Language (CN)")}
+                  detail={t("切换至中文体验", "Switch UI to English")}
+                  onClick={() => setLang(lang === "zh" ? "en" : "zh")}
                 />
               </section>
             </>
@@ -328,11 +337,12 @@ export function App() {
       </section>
 
       {panelMode === "add" ? (
-        <Modal title="Add Account" onClose={() => setPanelMode(null)}>
+        <Modal title={t("Add Account", "添加账号")} onClose={() => setPanelMode(null)}>
           <p className="modal-copy">
-            Codex Usage can launch the sign-in flow directly. A terminal window will open for the
-            native <code>codex login</code> flow, and this window will refresh itself when your
-            local auth state changes.
+            {t(
+              "Codex Usage can launch the sign-in flow directly. A terminal window will open for the native codex login flow...",
+              "您可以通过该辅助面板直接拉起原生 CLI 终端执行一次授权登录（基于本机凭证系统）。此窗口将在系统级认证结束后被自动刷新接管记录。"
+            )}
           </p>
           {loginLaunchMessage ? <div className="banner">{loginLaunchMessage}</div> : null}
           <div className="modal-actions">
@@ -342,46 +352,46 @@ export function App() {
               onClick={() => void handleLaunchAddAccount()}
               disabled={isLaunchingLogin}
             >
-              {isLaunchingLogin ? "Launching..." : "Start Login"}
+              {isLaunchingLogin ? t("Launching...", "正在拉起终端...") : t("Start Login", "开始拉起命令行登录")}
             </button>
             <button
               type="button"
               className="secondary-button"
               onClick={() => void refresh()}
             >
-              Check Again
+              {t("Check Again", "刷新凭证识别")}
             </button>
           </div>
         </Modal>
       ) : null}
 
       {panelMode === "status" && snapshot ? (
-        <Modal title="Status" onClose={() => setPanelMode(null)}>
+        <Modal title={t("Status", "核心状态")} onClose={() => setPanelMode(null)}>
           <div className="status-grid">
-            <StatusRow label="Service" value={formatServiceRuntime(snapshot.serviceRuntime)} />
-            <StatusRow label="Usage Mode" value={snapshot.apiUsageEnabled ? "API configured" : "Local mode"} />
-            <StatusRow label="Displayed Source" value={formatUsageSource(snapshot.usageSource)} />
-            <StatusRow label="Auto Switch" value={snapshot.autoSwitch.enabled ? "Enabled" : "Disabled"} />
-            <StatusRow label="5h Threshold" value={`${snapshot.autoSwitch.threshold5hPercent}%`} />
-            <StatusRow label="Weekly Threshold" value={`${snapshot.autoSwitch.thresholdWeeklyPercent}%`} />
-            <StatusRow label="Accounts" value={`${accountCount}`} />
+            <StatusRow label={t("Service", "系统守护进程")} value={formatServiceRuntime(snapshot.serviceRuntime, lang)} />
+            <StatusRow label={t("Usage Mode", "当前获取模式")} value={snapshot.apiUsageEnabled ? t("API configured", "API 被动请求") : t("Local mode", "本地流日志监听")} />
+            <StatusRow label={t("Displayed Source", "数据流来源")} value={formatUsageSource(snapshot.usageSource, lang)} />
+            <StatusRow label={t("Auto Switch", "后备自动漂移")} value={snapshot.autoSwitch.enabled ? t("Enabled", "已开启") : t("Disabled", "已关闭禁用")} />
+            <StatusRow label={t("5h Threshold", "单5小时健康阈值")} value={`${snapshot.autoSwitch.threshold5hPercent}%`} />
+            <StatusRow label={t("Weekly Threshold", "单7天健康阈值")} value={`${snapshot.autoSwitch.thresholdWeeklyPercent}%`} />
+            <StatusRow label={t("Accounts", "备源收录")} value={`${accountCount}`} />
             {snapshot.currentAccount ? (
-              <StatusRow label="Current Account" value={maskEmail(snapshot.currentAccount.email, showEmails)} />
+              <StatusRow label={t("Current Account", "正在消耗账号")} value={maskEmail(snapshot.currentAccount.email, showEmails)} />
             ) : null}
-            <StatusRow label="Active Since" value={formatTimestampMs(snapshot.activeAccountActivatedAtMs)} />
-            <StatusRow label="Local Rollout At" value={formatTimestampMs(snapshot.lastLocalRolloutEventAtMs)} />
+            <StatusRow label={t("Active Since", "上游接管点")} value={formatTimestampMs(snapshot.activeAccountActivatedAtMs, lang)} />
+            <StatusRow label={t("Local Rollout At", "本地记录锚点")} value={formatTimestampMs(snapshot.lastLocalRolloutEventAtMs, lang)} />
             <StatusRow
-              label="Local Rollout File"
-              value={snapshot.lastLocalRolloutPath ?? "None"}
+              label={t("Local Rollout File", "最后记录流文卷")}
+              value={snapshot.lastLocalRolloutPath ?? t("None", "无记录")}
               multiline
             />
-            <StatusRow label="Codex Home" value={snapshot.codexHome} multiline />
-            <StatusRow label="Registry" value={snapshot.registryPath} multiline />
-            <StatusRow label="Active Auth" value={snapshot.activeAuthPath} multiline />
-            <StatusRow label="Accounts Dir" value={snapshot.accountsDir} multiline />
+            <StatusRow label={t("Codex Home", "Codex 家目录")} value={snapshot.codexHome} multiline />
+            <StatusRow label={t("Registry", "中央登记簿")} value={snapshot.registryPath} multiline />
+            <StatusRow label={t("Active Auth", "活跃临时证")} value={snapshot.activeAuthPath} multiline />
+            <StatusRow label={t("Accounts Dir", "证件快照仓")} value={snapshot.accountsDir} multiline />
           </div>
           <div className="modal-footer-note">
-            External status page:{" "}
+            {t("External status page: ", "外部服务器官方探针节点：")}
             <a href="https://status.openai.com" target="_blank" rel="noreferrer">
               https://status.openai.com
             </a>
@@ -390,10 +400,10 @@ export function App() {
       ) : null}
 
       {panelMode === "settings" && snapshot && settingsDraft ? (
-        <Modal title="Settings" onClose={() => setPanelMode(null)}>
+        <Modal title={t("Settings", "核心设置")} onClose={() => setPanelMode(null)}>
           <div className="settings-grid">
             <label className="toggle-row">
-              <span>Auto switch</span>
+              <span>{t("Auto switch", "启用自动化越级切换")}</span>
               <input
                 type="checkbox"
                 checked={settingsDraft.autoSwitchEnabled}
@@ -401,9 +411,9 @@ export function App() {
                   setSettingsDraft((draft) =>
                     draft
                       ? {
-                          ...draft,
-                          autoSwitchEnabled: event.target.checked,
-                        }
+                        ...draft,
+                        autoSwitchEnabled: event.target.checked,
+                      }
                       : draft,
                   )
                 }
@@ -411,7 +421,7 @@ export function App() {
             </label>
 
             <label className="toggle-row">
-              <span>Record API usage mode</span>
+              <span>{t("Record API usage mode", "从外部 API 被动刷新")}</span>
               <input
                 type="checkbox"
                 checked={settingsDraft.apiUsageEnabled}
@@ -419,9 +429,9 @@ export function App() {
                   setSettingsDraft((draft) =>
                     draft
                       ? {
-                          ...draft,
-                          apiUsageEnabled: event.target.checked,
-                        }
+                        ...draft,
+                        apiUsageEnabled: event.target.checked,
+                      }
                       : draft,
                   )
                 }
@@ -429,7 +439,7 @@ export function App() {
             </label>
 
             <label className="field-row">
-              <span>5h threshold</span>
+              <span>{t("5h threshold", "5H 触发阈值警戒线")}</span>
               <input
                 type="number"
                 min={1}
@@ -439,9 +449,9 @@ export function App() {
                   setSettingsDraft((draft) =>
                     draft
                       ? {
-                          ...draft,
-                          threshold5hPercent: Number(event.target.value || 1),
-                        }
+                        ...draft,
+                        threshold5hPercent: Number(event.target.value || 1),
+                      }
                       : draft,
                   )
                 }
@@ -449,7 +459,7 @@ export function App() {
             </label>
 
             <label className="field-row">
-              <span>Weekly threshold</span>
+              <span>{t("Weekly threshold", "周均触发阈值警戒线")}</span>
               <input
                 type="number"
                 min={1}
@@ -459,9 +469,9 @@ export function App() {
                   setSettingsDraft((draft) =>
                     draft
                       ? {
-                          ...draft,
-                          thresholdWeeklyPercent: Number(event.target.value || 1),
-                        }
+                        ...draft,
+                        thresholdWeeklyPercent: Number(event.target.value || 1),
+                      }
                       : draft,
                   )
                 }
@@ -472,14 +482,14 @@ export function App() {
           <section className="service-card">
             <div className="service-card-head">
               <div>
-                <h4>Background Service</h4>
-                <p>Owns the Linux user timer for automatic checks.</p>
+                <h4>{t("Background Service", "常驻系统任务程序")}</h4>
+                <p>{t("Owns the OS user timer for automatic checks.", "这负责在本地系统级别写入任务，来达成零活守护机制。")}</p>
               </div>
-              <span className="service-runtime-badge">{formatServiceRuntime(snapshot.serviceRuntime)}</span>
+              <span className="service-runtime-badge">{formatServiceRuntime(snapshot.serviceRuntime, lang)}</span>
             </div>
             {serviceActionMessage ? <div className="banner">{serviceActionMessage}</div> : null}
             <div className="service-actions">
-              {serviceActionsForRuntime(snapshot.serviceRuntime).map((item) => (
+              {serviceActionsForRuntime(snapshot.serviceRuntime, lang).map((item) => (
                 <button
                   key={item.action}
                   type="button"
@@ -487,7 +497,7 @@ export function App() {
                   onClick={() => void handleServiceAction(item.action)}
                   disabled={isRunningServiceAction}
                 >
-                  {isRunningServiceAction ? "Working..." : item.label}
+                  {isRunningServiceAction ? t("Working...", "执行中...") : item.label}
                 </button>
               ))}
             </div>
@@ -495,7 +505,7 @@ export function App() {
 
           <div className="modal-actions">
             <button type="button" className="secondary-button" onClick={() => setPanelMode(null)}>
-              Cancel
+              {t("Cancel", "直接取消")}
             </button>
             <button
               type="button"
@@ -503,7 +513,7 @@ export function App() {
               onClick={() => void handleSaveSettings()}
               disabled={isSavingSettings}
             >
-              {isSavingSettings ? "Saving..." : "Save Settings"}
+              {isSavingSettings ? t("Saving...", "同步登记中...") : t("Save Settings", "硬保存写入")}
             </button>
           </div>
         </Modal>
@@ -515,9 +525,11 @@ export function App() {
 function UsageSection({
   title,
   window,
+  lang,
 }: {
   title: string;
   window: UsageWindowView | null;
+  lang: Lang;
 }) {
   const value = window?.remainingPercent ?? 0;
 
@@ -530,7 +542,7 @@ function UsageSection({
       <div className="meter">
         <span style={{ width: `${value}%` }} />
       </div>
-      <p>{formatResetLabel(window)}</p>
+      <p>{formatResetLabel(window, lang)}</p>
     </section>
   );
 }
@@ -592,7 +604,9 @@ function Modal({
             X
           </button>
         </header>
-        {children}
+        <div className="modal-body">
+          {children}
+        </div>
       </section>
     </div>
   );
@@ -623,7 +637,7 @@ function clampPercent(value: number): number {
   return Math.max(1, Math.min(100, Math.round(value)));
 }
 
-function serviceActionsForRuntime(runtime: string): Array<{
+function serviceActionsForRuntime(runtime: string, lang: Lang): Array<{
   action: ServiceAction;
   label: string;
   primary?: boolean;
@@ -631,22 +645,22 @@ function serviceActionsForRuntime(runtime: string): Array<{
   switch (runtime) {
     case "not-installed":
       return [
-        { action: "install", label: "Install & Start", primary: true },
-        { action: "run-now", label: "Run Check Now" },
+        { action: "install", label: lang === "zh" ? "安装并启动保护" : "Install & Start", primary: true },
+        { action: "run-now", label: lang === "zh" ? "手动走一次轮询" : "Run Check Now" },
       ];
     case "running":
       return [
-        { action: "run-now", label: "Run Check Now", primary: true },
-        { action: "stop", label: "Stop Service" },
-        { action: "uninstall", label: "Uninstall" },
+        { action: "run-now", label: lang === "zh" ? "手动走一次轮询" : "Run Check Now", primary: true },
+        { action: "stop", label: lang === "zh" ? "停止底层保护" : "Stop Service" },
+        { action: "uninstall", label: lang === "zh" ? "完全卸载卸下模块" : "Uninstall" },
       ];
     case "stopped":
       return [
-        { action: "start", label: "Start Service", primary: true },
-        { action: "run-now", label: "Run Check Now" },
-        { action: "uninstall", label: "Uninstall" },
+        { action: "start", label: lang === "zh" ? "重新激活守护" : "Start Service", primary: true },
+        { action: "run-now", label: lang === "zh" ? "手动走一次轮询" : "Run Check Now" },
+        { action: "uninstall", label: lang === "zh" ? "完全卸载卸下模块" : "Uninstall" },
       ];
     default:
-      return [{ action: "run-now", label: "Run Check Now", primary: true }];
+      return [{ action: "run-now", label: lang === "zh" ? "手动走一次轮询" : "Run Check Now", primary: true }];
   }
 }

@@ -11,14 +11,33 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+/// Windows creation flag that prevents a console window from being shown.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Create a `Command` that won't pop up a visible console window on Windows.
+#[cfg(target_os = "windows")]
+fn no_window_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 const CURRENT_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_THRESHOLD_5H: u8 = 10;
 const DEFAULT_THRESHOLD_WEEKLY: u8 = 5;
 const MAX_BACKUPS: usize = 5;
 const MAX_RECENT_ROLLOUT_FILES: usize = 1;
+#[cfg(target_os = "linux")]
 const LINUX_AUTO_SWITCH_SERVICE_NAME: &str = "codex-usage-autoswitch.service";
+#[cfg(target_os = "linux")]
 const LINUX_AUTO_SWITCH_TIMER_NAME: &str = "codex-usage-autoswitch.timer";
+#[cfg(target_os = "linux")]
 const LINUX_AUTO_SWITCH_TIMER_INTERVAL_SECS: u64 = 60;
+#[cfg(target_os = "linux")]
 const LOGIN_TERMINAL_SCRIPT: &str = r#"codex login
 status=$?
 echo
@@ -211,6 +230,7 @@ struct AuthInfo {
     record_key: Option<String>,
     plan: Option<String>,
     auth_mode: String,
+    access_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -299,7 +319,9 @@ pub fn update_settings(input: SettingsUpdate) -> Result<AppSnapshot, String> {
     registry.auto_switch.threshold_5h_percent = input.threshold_5h_percent;
     registry.auto_switch.threshold_weekly_percent = input.threshold_weekly_percent;
     registry.api.usage = input.api_usage_enabled;
-    if !registry.api.usage {
+    if registry.api.usage {
+        let _ = refresh_active_usage_from_api(&codex_home, &active_auth_path, &mut registry, &mut warnings)?;
+    } else {
         let _ = refresh_active_usage_from_sessions(&codex_home, &mut registry, &mut warnings)?;
     }
 
@@ -458,7 +480,7 @@ fn build_snapshot(
     let last_updated_at = registry
         .accounts
         .iter()
-        .filter_map(|record| record.last_usage_at)
+        .filter_map(|record| record.last_usage_at.map(normalize_usage_at))
         .max();
 
     let usage_source = current_record
@@ -470,13 +492,6 @@ fn build_snapshot(
     let last_local_rollout_event_at_ms = current_record
         .and_then(|record| record.last_local_rollout.as_ref())
         .map(|signature| signature.event_timestamp_ms);
-
-    if registry.api.usage {
-        warnings.push(
-            "Usage API mode is enabled in registry. This GUI does not make usage API calls; switch to local mode to refresh from session rollouts."
-                .to_string(),
-        );
-    }
 
     let service_runtime = query_service_runtime();
     if registry.auto_switch.enabled && service_runtime != "running" {
@@ -529,7 +544,9 @@ fn load_and_sync_registry(
     changed |=
         sync_registry_with_active_auth(codex_home, &active_auth_path, &mut registry, warnings)?;
     changed |= refresh_accounts_from_snapshots(codex_home, &mut registry)?;
-    if !registry.api.usage {
+    if registry.api.usage {
+        changed |= refresh_active_usage_from_api(codex_home, &active_auth_path, &mut registry, warnings)?;
+    } else {
         changed |= refresh_active_usage_from_sessions(codex_home, &mut registry, warnings)?;
     }
 
@@ -570,7 +587,31 @@ fn launch_codex_login_in_terminal() -> Result<(), String> {
     }))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn launch_codex_login_in_terminal() -> Result<(), String> {
+    let mut command = Command::new("powershell.exe");
+    // We use Start-Process to spawn a completely disconnected PowerShell console window.
+    // The internal script is wrapped in single quotes so PowerShell correctly passes it as a single string argument.
+    // Single quotes inside the script must be escaped as '' (two single quotes).
+    let inner_script = "$Host.UI.RawUI.WindowTitle = ''Codex Sign-In''; codex login; Write-Host ''''; Write-Host ''Press Enter to close...''; Read-Host";
+    let argument_list = format!("'-NoProfile', '-Command', '{}'", inner_script);
+
+    command.args([
+        "-NoProfile",
+        "-Command",
+        "Start-Process",
+        "powershell",
+        "-ArgumentList",
+        &argument_list,
+    ]);
+
+    match command.spawn() {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("Failed to launch terminal for Codex login: {error}")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn launch_codex_login_in_terminal() -> Result<(), String> {
     Err("Launching the Codex sign-in terminal is not implemented on this platform yet.".to_string())
 }
@@ -619,7 +660,9 @@ fn switch_account_in_registry(
         .map_err(|error| format!("Failed to replace auth.json: {error}"))?;
 
     let _ = set_active_account_key(registry, account_key);
-    if !registry.api.usage {
+    if registry.api.usage {
+        let _ = refresh_active_usage_from_api(codex_home, active_auth_path, registry, warnings)?;
+    } else {
         let _ = refresh_active_usage_from_sessions(codex_home, registry, warnings)?;
     }
     sort_accounts_by_email_key(&mut registry.accounts);
@@ -1261,21 +1304,27 @@ fn parse_auth_info_from_bytes(bytes: &[u8]) -> Result<AuthInfo, String> {
                 record_key: None,
                 plan: None,
                 auth_mode: "apikey".to_string(),
+                access_token: None,
             });
         }
     }
 
-    let tokens = object.get("tokens").and_then(Value::as_object);
-    if let Some(tokens) = tokens {
-        let account_id = tokens
-            .get("account_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let id_token = tokens.get("id_token").and_then(Value::as_str);
+    let get_prop = |k: &str| {
+        object
+            .get("tokens")
+            .and_then(Value::as_object)
+            .and_then(|t| t.get(k))
+            .or_else(|| object.get(k))
+    };
 
-        if let Some(jwt) = id_token {
+    let account_id = get_prop("account_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let id_token = get_prop("id_token").and_then(Value::as_str);
+
+    if let Some(jwt) = id_token {
             let payload = decode_jwt_payload(jwt)?;
             let claims: Value = serde_json::from_slice(&payload)
                 .map_err(|error| format!("Invalid id_token payload: {error}"))?;
@@ -1331,6 +1380,10 @@ fn parse_auth_info_from_bytes(bytes: &[u8]) -> Result<AuthInfo, String> {
             let user_id = chatgpt_user_id.ok_or_else(|| "Missing ChatGPT user id.".to_string())?;
             let record_key = format!("{user_id}::{resolved_account_id}");
 
+            let access_token = get_prop("access_token")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+
             return Ok(AuthInfo {
                 email,
                 chatgpt_account_id: Some(resolved_account_id),
@@ -1338,9 +1391,9 @@ fn parse_auth_info_from_bytes(bytes: &[u8]) -> Result<AuthInfo, String> {
                 record_key: Some(record_key),
                 plan,
                 auth_mode: "chatgpt".to_string(),
+                access_token,
             });
         }
-    }
 
     Ok(AuthInfo {
         email: None,
@@ -1349,6 +1402,7 @@ fn parse_auth_info_from_bytes(bytes: &[u8]) -> Result<AuthInfo, String> {
         record_key: None,
         plan: None,
         auth_mode: "chatgpt".to_string(),
+        access_token: None,
     })
 }
 
@@ -1418,7 +1472,7 @@ fn map_account(record: &AccountRecord, active_key: Option<&str>, now: i64) -> Ac
             resolve_rate_window(record.last_usage.as_ref(), 10080, false),
             now,
         ),
-        last_usage_at: record.last_usage_at,
+        last_usage_at: record.last_usage_at.map(normalize_usage_at),
     }
 }
 
@@ -1835,9 +1889,39 @@ fn install_auto_switch_service() -> Result<String, String> {
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn install_auto_switch_service() -> Result<String, String> {
-    Err("Auto switch service install is only supported on Linux right now.".to_string())
+    let executable = env::current_exe()
+        .map_err(|error| format!("Failed to resolve current executable path: {error}"))?;
+    let executable_text = executable.display().to_string();
+
+    let output = no_window_command("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            "CodexUsageAutoSwitch",
+            "/tr",
+            &format!("\"{}\" --auto-switch-check", executable_text),
+            "/sc",
+            "MINUTE",
+            "/mo",
+            "1",
+            "/f",
+        ])
+        .output()
+        .map_err(|error| format!("Failed to run schtasks: {error}"))?;
+
+    if output.status.success() {
+        Ok(format!("Installed Codex Usage auto switch service in Task Scheduler (CodexUsageAutoSwitch) bound to {}.", executable_text))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("Task Scheduler install failed: {}", stderr))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn install_auto_switch_service() -> Result<String, String> {
+    Err("Auto switch service install is not supported on this platform.".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -1847,9 +1931,24 @@ fn start_auto_switch_service() -> Result<String, String> {
     Ok("Started the Codex Usage auto switch timer.".to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn start_auto_switch_service() -> Result<String, String> {
-    Err("Auto switch service control is only supported on Linux right now.".to_string())
+    let output = no_window_command("schtasks")
+        .args(["/change", "/tn", "CodexUsageAutoSwitch", "/enable"])
+        .output()
+        .map_err(|error| format!("Failed to run schtasks: {error}"))?;
+
+    if output.status.success() {
+        Ok("Started the Codex Usage auto switch timer.".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("Task Scheduler start failed: {}", stderr))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn start_auto_switch_service() -> Result<String, String> {
+    Err("Auto switch service control is not supported on this platform.".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -1859,9 +1958,24 @@ fn stop_auto_switch_service() -> Result<String, String> {
     Ok("Stopped the Codex Usage auto switch timer.".to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn stop_auto_switch_service() -> Result<String, String> {
-    Err("Auto switch service control is only supported on Linux right now.".to_string())
+    let output = no_window_command("schtasks")
+        .args(["/change", "/tn", "CodexUsageAutoSwitch", "/disable"])
+        .output()
+        .map_err(|error| format!("Failed to run schtasks: {error}"))?;
+
+    if output.status.success() {
+        Ok("Stopped the Codex Usage auto switch timer.".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("Task Scheduler stop failed: {}", stderr))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn stop_auto_switch_service() -> Result<String, String> {
+    Err("Auto switch service control is not supported on this platform.".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -1882,9 +1996,33 @@ fn uninstall_auto_switch_service() -> Result<String, String> {
     Ok("Removed the Codex Usage auto switch service and timer.".to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn uninstall_auto_switch_service() -> Result<String, String> {
-    Err("Auto switch service uninstall is only supported on Linux right now.".to_string())
+    let output = no_window_command("schtasks")
+        .args(["/delete", "/tn", "CodexUsageAutoSwitch", "/f"])
+        .output()
+        .map_err(|error| format!("Failed to run schtasks: {error}"))?;
+
+    if output.status.success() {
+        Ok("Removed the Codex Usage auto switch service and timer.".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Ignore "not found" errors, just tell the user it was not installed
+        if output.status.code() == Some(1) && stderr.is_empty() { // Sometimes schtasks outputs to stdout instead on error
+            // Need to check stdout if stderr is empty? Let's just assume exit code 1 means not found if we are deleting.
+            // Actually, we can check the stdout output for "ERROR:"
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if stdout.contains("ERROR:") || stderr.contains("ERROR:") {
+             return Ok("Codex Usage auto switch service is not installed.".to_string());
+        }
+        Err(format!("Task Scheduler uninstall failed: {}", stderr.trim()))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn uninstall_auto_switch_service() -> Result<String, String> {
+    Err("Auto switch service uninstall is not supported on this platform.".to_string())
 }
 
 fn query_service_runtime() -> String {
@@ -1918,7 +2056,28 @@ fn query_service_runtime() -> String {
         };
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let output = no_window_command("schtasks")
+            .args(["/query", "/tn", "CodexUsageAutoSwitch", "/fo", "CSV", "/nh"])
+            .output();
+
+        return match output {
+            Ok(result) if result.status.success() => {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                let is_disabled = stdout.contains("\"Disabled\"") || stdout.contains("Disabled");
+                if is_disabled {
+                    "stopped".to_string()
+                } else {
+                    "running".to_string()
+                }
+            }
+            Ok(_) => "not-installed".to_string(), // Exit code != 0 means not found
+            Err(_) => "unknown".to_string(),
+        };
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         "unsupported".to_string()
     }
@@ -2043,4 +2202,172 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Normalizes a `last_usage_at` value: if it looks like milliseconds (> 10 billion),
+/// convert it back to seconds. This auto-heals data written by a previous buggy version.
+fn normalize_usage_at(value: i64) -> i64 {
+    if value > 10_000_000_000 {
+        value / 1000
+    } else {
+        value
+    }
+}
+
+fn parse_auth_info(path: &Path) -> Result<AuthInfo, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Read auth.json failed: {e}"))?;
+    parse_auth_info_from_bytes(&bytes)
+}
+
+fn refresh_active_usage_from_api(
+    _codex_home: &Path,
+    active_auth_path: &Path,
+    registry: &mut RegistryFile,
+    warnings: &mut Vec<String>,
+) -> Result<bool, String> {
+    let active_key = match &registry.active_account_key {
+        Some(k) => k.clone(),
+        None => return Ok(false),
+    };
+
+    let target_index = match registry.accounts.iter().position(|r| r.account_key == active_key) {
+        Some(idx) => idx,
+        None => return Ok(false),
+    };
+
+    let now_secs = now_unix_seconds();
+    let last_usage_at = normalize_usage_at(registry.accounts[target_index].last_usage_at.unwrap_or(0));
+
+    // Throttle API requests to at most once per 60 seconds to avoid Cloudflare bans and infinite watcher loops.
+    // When the user focuses the window, get_app_snapshot is called. We don't want to spawn powershell every time.
+    if now_secs - last_usage_at < 60 {
+        return Ok(false);
+    }
+
+    let auth_info = match parse_auth_info(active_auth_path) {
+        Ok(info) => info,
+        Err(err) => {
+            warnings.push(format!("API mode skipped: {err}"));
+            return Ok(false);
+        }
+    };
+
+    if auth_info.auth_mode != "chatgpt" || auth_info.access_token.is_none() || auth_info.chatgpt_account_id.is_none() {
+        warnings.push("API mode requires a ChatGPT account with an access_token.".to_string());
+        return Ok(false);
+    }
+
+    let access_token = auth_info.access_token.unwrap();
+    let account_id = auth_info.chatgpt_account_id.unwrap();
+
+    let output = match fetch_usage_from_wham(&access_token, &account_id) {
+        Ok(body_str) => body_str,
+        Err(err) => {
+            warnings.push(format!("API fetch failed: {err}"));
+            return Ok(false);
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&output) {
+        Ok(v) => v,
+        Err(err) => {
+            warnings.push(format!("API decode failed: {err}"));
+            return Ok(false);
+        }
+    };
+
+    let mut snapshot = RateLimitSnapshot::default();
+    if let Some(plan_type) = parsed.get("plan_type").and_then(Value::as_str) {
+        snapshot.plan_type = Some(plan_type.to_string());
+    }
+    
+    if let Some(rate_limit) = parsed.get("rate_limit").and_then(Value::as_object) {
+        if let Some(primary) = rate_limit.get("primary_window") {
+            snapshot.primary = parse_api_window(primary);
+        }
+        if let Some(secondary) = rate_limit.get("secondary_window") {
+            snapshot.secondary = parse_api_window(secondary);
+        }
+    }
+    
+    if snapshot.primary.is_none() && snapshot.secondary.is_none() {
+        warnings.push("API returned no valid tracking windows.".to_string());
+        return Ok(false);
+    }
+
+    registry.accounts[target_index].last_usage = Some(snapshot);
+    registry.accounts[target_index].last_usage_at = Some(now_unix_seconds());
+
+    Ok(true)
+}
+
+fn parse_api_window(v: &Value) -> Option<RateLimitWindow> {
+    let obj = v.as_object()?;
+    let used_percent = match obj.get("used_percent")? {
+        Value::Number(n) => n.as_f64().or_else(|| n.as_i64().map(|i| i as f64)).unwrap_or(0.0),
+        _ => return None,
+    };
+    let window_seconds = obj.get("limit_window_seconds").and_then(Value::as_i64);
+    let resets_at = obj.get("reset_at").and_then(Value::as_i64);
+    
+    let window_minutes = window_seconds.map(|s| (s + 59) / 60);
+    
+    Some(RateLimitWindow {
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_usage_from_wham(access_token: &str, account_id: &str) -> Result<String, String> {
+    let escaped_token = access_token.replace('\'', "''");
+    let escaped_account = account_id.replace('\'', "''");
+    let script = format!(
+        "$headers = @{{ Authorization = 'Bearer {}'; 'ChatGPT-Account-Id' = '{}'; 'User-Agent' = 'codex-auth'; 'Accept-Encoding' = 'identity' }}; \
+         $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Headers $headers -Uri 'https://chatgpt.com/backend-api/wham/usage'; \
+         [Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($response.Content)))",
+        escaped_token, escaped_account
+    );
+
+    let output = no_window_command("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| format!("PowerShell exec failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("Command failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&stdout)
+        .map_err(|_| "Base64 decode failed".to_string())?;
+
+    Ok(String::from_utf8_lossy(&decoded).into_owned())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn fetch_usage_from_wham(access_token: &str, account_id: &str) -> Result<String, String> {
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--location",
+            "--connect-timeout", "10",
+            "--max-time", "15",
+            "-H", &format!("Authorization: Bearer {access_token}"),
+            "-H", &format!("ChatGPT-Account-Id: {account_id}"),
+            "-H", "User-Agent: codex-auth",
+            "-H", "Accept-Encoding: identity",
+            "https://chatgpt.com/backend-api/wham/usage",
+        ])
+        .output()
+        .map_err(|e| format!("Curl spawn failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("Curl error: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

@@ -35,6 +35,8 @@ button {
 
 .panel {
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: min(100%, 420px);
   height: calc(100vh - 20px);
   margin: 0 0 0 auto;
@@ -90,21 +92,36 @@ button {
   cursor: grab;
   -webkit-user-select: none;
   user-select: none;
+  flex-shrink: 0;
 }
 
 .panel-scroll {
-  height: calc(100% - 54px);
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding-right: 4px;
 }
 
-.panel-scroll::-webkit-scrollbar {
-  width: 8px;
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
 }
 
-.panel-scroll::-webkit-scrollbar-thumb {
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
   border-radius: 999px;
-  background: rgba(69, 118, 136, 0.22);
+  background: rgba(43, 85, 102, 0.22);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(43, 85, 102, 0.45);
+  border: 3px solid transparent;
+  background-clip: padding-box;
 }
 
 .topbar {
@@ -114,6 +131,7 @@ button {
   gap: 12px;
   padding-bottom: 14px;
   border-bottom: 1px solid rgba(96, 136, 151, 0.14);
+  flex-shrink: 0;
 }
 
 .topbar-copy {
@@ -256,7 +274,7 @@ button {
   color: #455a6b;
 }
 
-.usage-block + .usage-block {
+.usage-block+.usage-block {
   margin-top: 20px;
 }
 
@@ -433,6 +451,9 @@ button {
 
 .modal-card {
   width: min(460px, 100%);
+  max-height: calc(100vh - 36px);
+  display: flex;
+  flex-direction: column;
   padding: 18px;
   border: 1px solid rgba(255, 255, 255, 0.44);
   border-radius: 26px;
@@ -452,6 +473,14 @@ button {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 14px;
+  flex-shrink: 0;
+}
+
+.modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .modal-header h3 {

@@ -80,8 +80,8 @@ codex-usage --uninstall-auto-switch-service
 推送版本标签以触发 Release 工作流:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 GitHub Actions 将自动构建适用于 Linux、macOS 和 Windows 的安装包并上传至对应的 GitHub Release 页面。

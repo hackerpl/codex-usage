@@ -80,8 +80,8 @@ codex-usage --uninstall-auto-switch-service
 Push a version tag to trigger the release workflow:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The GitHub Actions release workflow builds desktop bundles for Linux, macOS, and Windows and uploads them to the matching GitHub Release.

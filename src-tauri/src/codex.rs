@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::env;
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -38,18 +40,7 @@ const LINUX_AUTO_SWITCH_TIMER_NAME: &str = "codex-usage-autoswitch.timer";
 #[cfg(target_os = "linux")]
 const LINUX_AUTO_SWITCH_TIMER_INTERVAL_SECS: u64 = 60;
 #[cfg(target_os = "linux")]
-const LOGIN_TERMINAL_SCRIPT: &str = r#"codex login
-status=$?
-echo
-if [ "$status" -eq 0 ]; then
-  echo "Sign-in finished. Codex Usage will refresh automatically."
-else
-  echo "Sign-in failed with exit code $status."
-fi
-printf "Press Enter to close..."
-read -r _
-exit "$status"
-"#;
+const DEFAULT_LINUX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -320,7 +311,12 @@ pub fn update_settings(input: SettingsUpdate) -> Result<AppSnapshot, String> {
     registry.auto_switch.threshold_weekly_percent = input.threshold_weekly_percent;
     registry.api.usage = input.api_usage_enabled;
     if registry.api.usage {
-        let _ = refresh_active_usage_from_api(&codex_home, &active_auth_path, &mut registry, &mut warnings)?;
+        let _ = refresh_active_usage_from_api(
+            &codex_home,
+            &active_auth_path,
+            &mut registry,
+            &mut warnings,
+        )?;
     } else {
         let _ = refresh_active_usage_from_sessions(&codex_home, &mut registry, &mut warnings)?;
     }
@@ -387,15 +383,12 @@ pub fn run_auto_switch_check() -> Result<AutoSwitchOutcome, String> {
     }
 
     let now = now_unix_seconds();
-    let active_index = registry
-        .active_account_key
-        .as_deref()
-        .and_then(|key| {
-            registry
-                .accounts
-                .iter()
-                .position(|record| record.account_key == key)
-        });
+    let active_index = registry.active_account_key.as_deref().and_then(|key| {
+        registry
+            .accounts
+            .iter()
+            .position(|record| record.account_key == key)
+    });
     let decision = decide_auto_switch_target(&registry, active_index, now);
 
     if let Some(target_index) = decision.target_index {
@@ -545,7 +538,8 @@ fn load_and_sync_registry(
         sync_registry_with_active_auth(codex_home, &active_auth_path, &mut registry, warnings)?;
     changed |= refresh_accounts_from_snapshots(codex_home, &mut registry)?;
     if registry.api.usage {
-        changed |= refresh_active_usage_from_api(codex_home, &active_auth_path, &mut registry, warnings)?;
+        changed |=
+            refresh_active_usage_from_api(codex_home, &active_auth_path, &mut registry, warnings)?;
     } else {
         changed |= refresh_active_usage_from_sessions(codex_home, &mut registry, warnings)?;
     }
@@ -569,9 +563,12 @@ fn launch_codex_login_in_terminal() -> Result<(), String> {
         ("xterm", &["-e", "bash", "-lc"]),
     ];
 
+    let codex_cli = resolve_codex_cli_path()?;
+    let script = build_login_terminal_script(&codex_cli);
+    let launch_path = build_login_terminal_path(&codex_cli);
     let mut launch_error = None;
     for (program, args) in TERMINAL_CANDIDATES {
-        match spawn_terminal_program(program, args, LOGIN_TERMINAL_SCRIPT) {
+        match spawn_terminal_program(program, args, &script, &launch_path) {
             Ok(true) => return Ok(()),
             Ok(false) => continue,
             Err(error) => {
@@ -607,7 +604,9 @@ fn launch_codex_login_in_terminal() -> Result<(), String> {
 
     match command.spawn() {
         Ok(_) => Ok(()),
-        Err(error) => Err(format!("Failed to launch terminal for Codex login: {error}")),
+        Err(error) => Err(format!(
+            "Failed to launch terminal for Codex login: {error}"
+        )),
     }
 }
 
@@ -617,15 +616,176 @@ fn launch_codex_login_in_terminal() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_terminal_program(program: &str, args: &[&str], script: &str) -> Result<bool, String> {
+fn spawn_terminal_program(
+    program: &str,
+    args: &[&str],
+    script: &str,
+    launch_path: &OsString,
+) -> Result<bool, String> {
     let mut command = Command::new(program);
     command.args(args).arg(script);
+    command.env("PATH", launch_path);
 
     match command.spawn() {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("Failed to launch {program}: {error}")),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_codex_cli_path() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+
+    if let Some(path_env) = env::var_os("PATH") {
+        collect_codex_candidates_from_path(&path_env, &mut candidates);
+    }
+
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        for relative in [".cargo/bin/codex", ".local/bin/codex"] {
+            push_candidate(&mut candidates, home.join(relative));
+        }
+
+        let extension_roots = known_editor_extension_roots(&home);
+        collect_editor_extension_codex_candidates(&extension_roots, &mut candidates);
+    }
+
+    for shell_args in [["-lc", "type -P codex"], ["-ic", "type -P codex"]] {
+        if let Some(path) = discover_codex_with_bash(&shell_args) {
+            push_candidate(&mut candidates, path);
+        }
+    }
+
+    candidates.into_iter().next().ok_or_else(|| {
+        "Codex CLI was not found. Install Codex or add its executable directory to PATH, then retry."
+            .to_string()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn build_login_terminal_script(codex_cli: &Path) -> String {
+    let escaped_codex = shell_single_quote(&codex_cli.to_string_lossy());
+    format!(
+        r#"{escaped_codex} login
+status=$?
+echo
+if [ "$status" -eq 0 ]; then
+  echo "Sign-in finished. Codex Usage will refresh automatically."
+else
+  echo "Sign-in failed with exit code $status."
+fi
+printf "Press Enter to close..."
+read -r _
+exit "$status"
+"#
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn build_login_terminal_path(codex_cli: &Path) -> OsString {
+    let mut dirs = Vec::new();
+    if let Some(parent) = codex_cli.parent() {
+        push_path_dir(&mut dirs, parent.to_path_buf());
+    }
+
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        push_path_dir(&mut dirs, home.join(".cargo/bin"));
+        push_path_dir(&mut dirs, home.join(".local/bin"));
+    }
+
+    if let Some(path_env) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_env) {
+            push_path_dir(&mut dirs, dir);
+        }
+    }
+
+    env::join_paths(&dirs).unwrap_or_else(|_| OsString::from(DEFAULT_LINUX_PATH))
+}
+
+#[cfg(target_os = "linux")]
+fn collect_codex_candidates_from_path(path_env: &OsString, candidates: &mut Vec<PathBuf>) {
+    for dir in env::split_paths(path_env) {
+        push_candidate(candidates, dir.join("codex"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_editor_extension_codex_candidates(roots: &[PathBuf], candidates: &mut Vec<PathBuf>) {
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let extension_name = entry.file_name();
+            let extension_name = extension_name.to_string_lossy();
+            if !extension_name.starts_with("openai.chatgpt-") {
+                continue;
+            }
+
+            let Ok(platform_dirs) = fs::read_dir(entry.path().join("bin")) else {
+                continue;
+            };
+
+            for platform_dir in platform_dirs.flatten() {
+                push_candidate(candidates, platform_dir.path().join("codex"));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn known_editor_extension_roots(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".vscode").join("extensions"),
+        home.join(".vscode-insiders").join("extensions"),
+        home.join(".vscode-oss").join("extensions"),
+        home.join(".cursor").join("extensions"),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn discover_codex_with_bash(args: &[&str; 2]) -> Option<PathBuf> {
+    let output = Command::new("bash").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().find(|line| !line.trim().is_empty())?.trim();
+    if !line.contains('/') {
+        return None;
+    }
+
+    Some(PathBuf::from(line))
+}
+
+#[cfg(target_os = "linux")]
+fn push_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidate.is_file() {
+        return;
+    }
+
+    let candidate = fs::canonicalize(&candidate).unwrap_or(candidate);
+    if candidates.iter().all(|existing| existing != &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn push_path_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dir.is_dir() {
+        return;
+    }
+
+    if dirs.iter().all(|existing| existing != &dir) {
+        dirs.push(dir);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn switch_account_in_registry(
@@ -685,12 +845,10 @@ fn decide_auto_switch_target(
     let threshold_5h = registry.auto_switch.threshold_5h_percent as i64;
     let threshold_weekly = registry.auto_switch.threshold_weekly_percent as i64;
 
-    let best_meeting_thresholds = pick_best_account_index(
-        &registry.accounts,
-        active_index,
-        now,
-        |record| account_meets_thresholds(record, now, threshold_5h, threshold_weekly),
-    );
+    let best_meeting_thresholds =
+        pick_best_account_index(&registry.accounts, active_index, now, |record| {
+            account_meets_thresholds(record, now, threshold_5h, threshold_weekly)
+        });
     let best_alternate = pick_best_account_index(&registry.accounts, active_index, now, |_| true);
 
     match active_index {
@@ -752,7 +910,8 @@ fn decide_auto_switch_target(
 
             AutoSwitchDecision {
                 target_index: None,
-                reason: "Auto switch skipped: there is no account with usable usage data yet.".to_string(),
+                reason: "Auto switch skipped: there is no account with usable usage data yet."
+                    .to_string(),
             }
         }
     }
@@ -775,11 +934,9 @@ where
         }
 
         let replace = match best_index {
-            Some(current_best) => is_better_auto_switch_candidate(
-                record,
-                &accounts[current_best],
-                now,
-            ),
+            Some(current_best) => {
+                is_better_auto_switch_candidate(record, &accounts[current_best], now)
+            }
             None => true,
         };
 
@@ -791,11 +948,7 @@ where
     best_index
 }
 
-fn is_better_auto_switch_candidate(
-    lhs: &AccountRecord,
-    rhs: &AccountRecord,
-    now: i64,
-) -> bool {
+fn is_better_auto_switch_candidate(lhs: &AccountRecord, rhs: &AccountRecord, now: i64) -> bool {
     let lhs_score = usage_score_at(lhs.last_usage.as_ref(), now).unwrap_or(-1);
     let rhs_score = usage_score_at(rhs.last_usage.as_ref(), now).unwrap_or(-1);
     if lhs_score != rhs_score {
@@ -827,7 +980,10 @@ fn account_meets_thresholds(
     threshold_5h: i64,
     threshold_weekly: i64,
 ) -> bool {
-    let remaining_5h = remaining_percent_at(resolve_rate_window(record.last_usage.as_ref(), 300, true), now);
+    let remaining_5h = remaining_percent_at(
+        resolve_rate_window(record.last_usage.as_ref(), 300, true),
+        now,
+    );
     let remaining_weekly = remaining_percent_at(
         resolve_rate_window(record.last_usage.as_ref(), 10080, false),
         now,
@@ -842,7 +998,10 @@ fn account_meets_thresholds(
 }
 
 fn format_usage_health(record: &AccountRecord, now: i64) -> String {
-    let remaining_5h = remaining_percent_at(resolve_rate_window(record.last_usage.as_ref(), 300, true), now);
+    let remaining_5h = remaining_percent_at(
+        resolve_rate_window(record.last_usage.as_ref(), 300, true),
+        now,
+    );
     let remaining_weekly = remaining_percent_at(
         resolve_rate_window(record.last_usage.as_ref(), 10080, false),
         now,
@@ -1325,75 +1484,74 @@ fn parse_auth_info_from_bytes(bytes: &[u8]) -> Result<AuthInfo, String> {
     let id_token = get_prop("id_token").and_then(Value::as_str);
 
     if let Some(jwt) = id_token {
-            let payload = decode_jwt_payload(jwt)?;
-            let claims: Value = serde_json::from_slice(&payload)
-                .map_err(|error| format!("Invalid id_token payload: {error}"))?;
-            let claims_object = claims
-                .as_object()
-                .ok_or_else(|| "Invalid id_token payload object.".to_string())?;
+        let payload = decode_jwt_payload(jwt)?;
+        let claims: Value = serde_json::from_slice(&payload)
+            .map_err(|error| format!("Invalid id_token payload: {error}"))?;
+        let claims_object = claims
+            .as_object()
+            .ok_or_else(|| "Invalid id_token payload object.".to_string())?;
 
-            let email = claims_object
-                .get("email")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_ascii_lowercase());
+        let email = claims_object
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
 
-            let auth_claims = claims_object
-                .get("https://api.openai.com/auth")
-                .and_then(Value::as_object);
+        let auth_claims = claims_object
+            .get("https://api.openai.com/auth")
+            .and_then(Value::as_object);
 
-            let jwt_account_id = auth_claims
-                .and_then(|claims| claims.get("chatgpt_account_id"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
+        let jwt_account_id = auth_claims
+            .and_then(|claims| claims.get("chatgpt_account_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
 
-            let chatgpt_user_id = auth_claims
-                .and_then(|claims| {
-                    claims
-                        .get("chatgpt_user_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| claims.get("user_id").and_then(Value::as_str))
-                })
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
+        let chatgpt_user_id = auth_claims
+            .and_then(|claims| {
+                claims
+                    .get("chatgpt_user_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| claims.get("user_id").and_then(Value::as_str))
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
 
-            let plan = auth_claims
-                .and_then(|claims| claims.get("chatgpt_plan_type"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_ascii_lowercase());
+        let plan = auth_claims
+            .and_then(|claims| claims.get("chatgpt_plan_type"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
 
-            let resolved_account_id = account_id
-                .clone()
-                .ok_or_else(|| "Missing account_id.".to_string())?;
-            let jwt_account_id =
-                jwt_account_id.ok_or_else(|| "Missing JWT account id.".to_string())?;
-            if resolved_account_id != jwt_account_id {
-                return Err("account_id mismatch between tokens and JWT claims.".to_string());
-            }
-
-            let user_id = chatgpt_user_id.ok_or_else(|| "Missing ChatGPT user id.".to_string())?;
-            let record_key = format!("{user_id}::{resolved_account_id}");
-
-            let access_token = get_prop("access_token")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-
-            return Ok(AuthInfo {
-                email,
-                chatgpt_account_id: Some(resolved_account_id),
-                chatgpt_user_id: Some(user_id),
-                record_key: Some(record_key),
-                plan,
-                auth_mode: "chatgpt".to_string(),
-                access_token,
-            });
+        let resolved_account_id = account_id
+            .clone()
+            .ok_or_else(|| "Missing account_id.".to_string())?;
+        let jwt_account_id = jwt_account_id.ok_or_else(|| "Missing JWT account id.".to_string())?;
+        if resolved_account_id != jwt_account_id {
+            return Err("account_id mismatch between tokens and JWT claims.".to_string());
         }
+
+        let user_id = chatgpt_user_id.ok_or_else(|| "Missing ChatGPT user id.".to_string())?;
+        let record_key = format!("{user_id}::{resolved_account_id}");
+
+        let access_token = get_prop("access_token")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        return Ok(AuthInfo {
+            email,
+            chatgpt_account_id: Some(resolved_account_id),
+            chatgpt_user_id: Some(user_id),
+            record_key: Some(record_key),
+            plan,
+            auth_mode: "chatgpt".to_string(),
+            access_token,
+        });
+    }
 
     Ok(AuthInfo {
         email: None,
@@ -2009,14 +2167,17 @@ fn uninstall_auto_switch_service() -> Result<String, String> {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         // Ignore "not found" errors, just tell the user it was not installed
         if output.status.code() == Some(1) && stderr.is_empty() { // Sometimes schtasks outputs to stdout instead on error
-            // Need to check stdout if stderr is empty? Let's just assume exit code 1 means not found if we are deleting.
-            // Actually, we can check the stdout output for "ERROR:"
+             // Need to check stdout if stderr is empty? Let's just assume exit code 1 means not found if we are deleting.
+             // Actually, we can check the stdout output for "ERROR:"
         }
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         if stdout.contains("ERROR:") || stderr.contains("ERROR:") {
-             return Ok("Codex Usage auto switch service is not installed.".to_string());
+            return Ok("Codex Usage auto switch service is not installed.".to_string());
         }
-        Err(format!("Task Scheduler uninstall failed: {}", stderr.trim()))
+        Err(format!(
+            "Task Scheduler uninstall failed: {}",
+            stderr.trim()
+        ))
     }
 }
 
@@ -2097,8 +2258,12 @@ fn ensure_auto_switch_units_exist() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn ensure_systemd_user_unit_dir() -> Result<PathBuf, String> {
     let path = systemd_user_unit_dir()?;
-    fs::create_dir_all(&path)
-        .map_err(|error| format!("Failed to create systemd user dir {}: {error}", path.display()))?;
+    fs::create_dir_all(&path).map_err(|error| {
+        format!(
+            "Failed to create systemd user dir {}: {error}",
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 
@@ -2230,13 +2395,18 @@ fn refresh_active_usage_from_api(
         None => return Ok(false),
     };
 
-    let target_index = match registry.accounts.iter().position(|r| r.account_key == active_key) {
+    let target_index = match registry
+        .accounts
+        .iter()
+        .position(|r| r.account_key == active_key)
+    {
         Some(idx) => idx,
         None => return Ok(false),
     };
 
     let now_secs = now_unix_seconds();
-    let last_usage_at = normalize_usage_at(registry.accounts[target_index].last_usage_at.unwrap_or(0));
+    let last_usage_at =
+        normalize_usage_at(registry.accounts[target_index].last_usage_at.unwrap_or(0));
 
     // Throttle API requests to at most once per 60 seconds to avoid Cloudflare bans and infinite watcher loops.
     // When the user focuses the window, get_app_snapshot is called. We don't want to spawn powershell every time.
@@ -2252,7 +2422,10 @@ fn refresh_active_usage_from_api(
         }
     };
 
-    if auth_info.auth_mode != "chatgpt" || auth_info.access_token.is_none() || auth_info.chatgpt_account_id.is_none() {
+    if auth_info.auth_mode != "chatgpt"
+        || auth_info.access_token.is_none()
+        || auth_info.chatgpt_account_id.is_none()
+    {
         warnings.push("API mode requires a ChatGPT account with an access_token.".to_string());
         return Ok(false);
     }
@@ -2280,7 +2453,7 @@ fn refresh_active_usage_from_api(
     if let Some(plan_type) = parsed.get("plan_type").and_then(Value::as_str) {
         snapshot.plan_type = Some(plan_type.to_string());
     }
-    
+
     if let Some(rate_limit) = parsed.get("rate_limit").and_then(Value::as_object) {
         if let Some(primary) = rate_limit.get("primary_window") {
             snapshot.primary = parse_api_window(primary);
@@ -2289,7 +2462,7 @@ fn refresh_active_usage_from_api(
             snapshot.secondary = parse_api_window(secondary);
         }
     }
-    
+
     if snapshot.primary.is_none() && snapshot.secondary.is_none() {
         warnings.push("API returned no valid tracking windows.".to_string());
         return Ok(false);
@@ -2304,14 +2477,17 @@ fn refresh_active_usage_from_api(
 fn parse_api_window(v: &Value) -> Option<RateLimitWindow> {
     let obj = v.as_object()?;
     let used_percent = match obj.get("used_percent")? {
-        Value::Number(n) => n.as_f64().or_else(|| n.as_i64().map(|i| i as f64)).unwrap_or(0.0),
+        Value::Number(n) => n
+            .as_f64()
+            .or_else(|| n.as_i64().map(|i| i as f64))
+            .unwrap_or(0.0),
         _ => return None,
     };
     let window_seconds = obj.get("limit_window_seconds").and_then(Value::as_i64);
     let resets_at = obj.get("reset_at").and_then(Value::as_i64);
-    
+
     let window_minutes = window_seconds.map(|s| (s + 59) / 60);
-    
+
     Some(RateLimitWindow {
         used_percent,
         window_minutes,
@@ -2336,7 +2512,10 @@ fn fetch_usage_from_wham(access_token: &str, account_id: &str) -> Result<String,
         .map_err(|e| format!("PowerShell exec failed: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("Command failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "Command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2354,20 +2533,79 @@ fn fetch_usage_from_wham(access_token: &str, account_id: &str) -> Result<String,
             "--silent",
             "--show-error",
             "--location",
-            "--connect-timeout", "10",
-            "--max-time", "15",
-            "-H", &format!("Authorization: Bearer {access_token}"),
-            "-H", &format!("ChatGPT-Account-Id: {account_id}"),
-            "-H", "User-Agent: codex-auth",
-            "-H", "Accept-Encoding: identity",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "15",
+            "-H",
+            &format!("Authorization: Bearer {access_token}"),
+            "-H",
+            &format!("ChatGPT-Account-Id: {account_id}"),
+            "-H",
+            "User-Agent: codex-auth",
+            "-H",
+            "Accept-Encoding: identity",
             "https://chatgpt.com/backend-api/wham/usage",
         ])
         .output()
         .map_err(|e| format!("Curl spawn failed: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("Curl error: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "Curl error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_single_quote_escapes_single_quotes() {
+        assert_eq!(
+            shell_single_quote("/tmp/it'works/codex"),
+            "'/tmp/it'\\''works/codex'"
+        );
+    }
+
+    #[test]
+    fn collect_editor_extension_codex_candidates_finds_vscode_binary() {
+        let root = make_test_dir("codex-extension");
+        let candidate = root
+            .join("openai.chatgpt-1.0.0-linux-x64")
+            .join("bin")
+            .join("linux-x86_64")
+            .join("codex");
+
+        fs::create_dir_all(candidate.parent().unwrap()).expect("create extension tree");
+        fs::write(&candidate, b"#!/bin/sh\n").expect("create codex placeholder");
+
+        let mut candidates = Vec::new();
+        collect_editor_extension_codex_candidates(std::slice::from_ref(&root), &mut candidates);
+
+        assert_eq!(
+            candidates,
+            vec![fs::canonicalize(candidate).expect("canonical path")]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup test dir");
+    }
+
+    fn make_test_dir(prefix: &str) -> PathBuf {
+        let unique = format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let dir = env::temp_dir().join(unique);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 }

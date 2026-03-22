@@ -589,7 +589,7 @@ fn launch_codex_login_in_terminal() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn launch_codex_login_in_terminal() -> Result<(), String> {
-    let mut command = Command::new("powershell.exe");
+    let mut command = no_window_command("powershell.exe");
     // We use Start-Process to spawn a completely disconnected PowerShell console window.
     // The internal script is wrapped in single quotes so PowerShell correctly passes it as a single string argument.
     // Single quotes inside the script must be escaped as '' (two single quotes).

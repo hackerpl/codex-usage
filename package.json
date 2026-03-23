@@ -1,11 +1,12 @@
 {
   "name": "codex-usage",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "clean": "node -e \"const fs=require('fs');['dist','node_modules/.vite','src-tauri/target'].forEach((p)=>fs.rmSync(p,{recursive:true,force:true}));\"",
+    "build": "npm run clean && tsc && vite build",
     "preview": "vite preview",
     "tauri:dev": "./scripts/desktop-env.sh tauri dev",
     "tauri:build": "PATH=\"$HOME/.cargo/bin:$PATH\" tauri build"

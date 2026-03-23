@@ -1,4 +1,5 @@
 import { mockSnapshot } from "./mock";
+import type { Lang } from "./format";
 import type { AppSnapshot, ServiceAction, ServiceActionResult, SettingsUpdate } from "./types";
 
 function withFallback(message: string): AppSnapshot {
@@ -109,6 +110,16 @@ export async function hideCurrentWindowIfPossible(): Promise<void> {
 export async function quitApp(): Promise<void> {
   try {
     await invokeCommand("quit_app");
+  } catch (error) {
+    if (!isPreviewRuntimeError(error)) {
+      throw error;
+    }
+  }
+}
+
+export async function setUiLanguage(lang: Lang): Promise<void> {
+  try {
+    await invokeCommand("set_ui_language", { lang });
   } catch (error) {
     if (!isPreviewRuntimeError(error)) {
       throw error;

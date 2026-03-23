@@ -19,13 +19,16 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "codex-usage-tray";
 const MENU_OPEN_ID: &str = "tray-open";
 const MENU_HIDE_ID: &str = "tray-hide";
+const MENU_ADD_ACCOUNT_ID: &str = "tray-add-account";
+const MENU_STATUS_ID: &str = "tray-status";
+const MENU_SETTINGS_ID: &str = "tray-settings";
 const MENU_QUIT_ID: &str = "tray-quit";
 const STATE_INVALIDATED_EVENT: &str = "codex://state-invalidated";
+const TRAY_PANEL_EVENT: &str = "codex://tray-panel";
 const TRACE_REFRESH_ENV: &str = "CODEX_USAGE_TRACE_REFRESH";
 const TRACE_REFRESH_LOG_PATH: &str = "/tmp/codex-usage-trace.log";
 const WINDOW_MARGIN: i32 = 18;
 const SESSION_INVALIDATION_MIN_INTERVAL: Duration = Duration::from_secs(15);
-const WINDOW_HIDE_ON_BLUR_DELAY: Duration = Duration::from_millis(220);
 static WATCHER_TX: OnceLock<mpsc::Sender<WatchMessage>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -39,6 +42,55 @@ struct WatchPaths {
 enum WatchMessage {
     Fs(notify::Result<Event>),
     SetSessionsTracking(bool),
+}
+
+#[derive(Clone, Copy)]
+enum UiLanguage {
+    Zh,
+    En,
+}
+
+impl UiLanguage {
+    fn from_input(input: &str) -> Self {
+        if input.eq_ignore_ascii_case("en") {
+            Self::En
+        } else {
+            Self::Zh
+        }
+    }
+}
+
+struct TrayLabels {
+    open: &'static str,
+    hide: &'static str,
+    add_account: &'static str,
+    status: &'static str,
+    settings: &'static str,
+    quit: &'static str,
+    tooltip: &'static str,
+}
+
+fn tray_labels(language: UiLanguage) -> TrayLabels {
+    match language {
+        UiLanguage::Zh => TrayLabels {
+            open: "打开主窗口",
+            hide: "隐藏窗口",
+            add_account: "添加账号",
+            status: "查看状态详情",
+            settings: "偏好设置",
+            quit: "退出应用",
+            tooltip: "Codex 用量",
+        },
+        UiLanguage::En => TrayLabels {
+            open: "Open Window",
+            hide: "Hide Window",
+            add_account: "Add Account",
+            status: "Status Details",
+            settings: "Preferences",
+            quit: "Quit",
+            tooltip: "Codex Usage",
+        },
+    }
 }
 
 #[tauri::command]
@@ -76,6 +128,12 @@ fn manage_auto_switch_service(action: String) -> Result<codex::ServiceActionResu
 fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+fn set_ui_language(app: tauri::AppHandle, lang: String) -> Result<(), String> {
+    let language = UiLanguage::from_input(&lang);
+    apply_tray_language(&app, language)
 }
 
 pub fn try_run_cli_from_args() -> Option<Result<(), String>> {
@@ -133,7 +191,8 @@ pub fn run() {
             update_settings,
             launch_add_account_login,
             manage_auto_switch_service,
-            quit_app
+            quit_app,
+            set_ui_language
         ])
         .run(tauri::generate_context!())
         .expect("failed to run codex-usage");
@@ -151,14 +210,12 @@ fn setup_main_window<R: Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()> {
 }
 
 fn setup_tray<R: Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()> {
-    let open_item = MenuItem::with_id(app, MENU_OPEN_ID, "Open Codex Usage", true, None::<&str>)?;
-    let hide_item = MenuItem::with_id(app, MENU_HIDE_ID, "Hide Window", true, None::<&str>)?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, MENU_QUIT_ID, "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open_item, &hide_item, &separator, &quit_item])?;
+    let app_handle = app.handle();
+    let labels = tray_labels(UiLanguage::Zh);
+    let menu = build_tray_menu(&app_handle, UiLanguage::Zh)?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
-        .tooltip("Codex Usage")
+        .tooltip(labels.tooltip)
         .show_menu_on_left_click(false);
 
     if let Some(icon) = app.default_window_icon().cloned() {
@@ -169,6 +226,50 @@ fn setup_tray<R: Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()> {
     Ok(())
 }
 
+fn build_tray_menu<R: Runtime>(app: &AppHandle<R>, language: UiLanguage) -> tauri::Result<Menu<R>> {
+    let labels = tray_labels(language);
+    let open_item = MenuItem::with_id(app, MENU_OPEN_ID, labels.open, true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, MENU_HIDE_ID, labels.hide, true, None::<&str>)?;
+    let add_account_item =
+        MenuItem::with_id(app, MENU_ADD_ACCOUNT_ID, labels.add_account, true, None::<&str>)?;
+    let status_item = MenuItem::with_id(app, MENU_STATUS_ID, labels.status, true, None::<&str>)?;
+    let settings_item =
+        MenuItem::with_id(app, MENU_SETTINGS_ID, labels.settings, true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let separator_bottom = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, MENU_QUIT_ID, labels.quit, true, None::<&str>)?;
+    Menu::with_items(
+        app,
+        &[
+            &open_item,
+            &hide_item,
+            &separator,
+            &add_account_item,
+            &status_item,
+            &settings_item,
+            &separator_bottom,
+            &quit_item,
+        ],
+    )
+}
+
+fn apply_tray_language<R: Runtime>(app: &AppHandle<R>, language: UiLanguage) -> Result<(), String> {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return Ok(());
+    };
+    let labels = tray_labels(language);
+    let menu = build_tray_menu(app, language).map_err(|error| error.to_string())?;
+    tray.set_menu(Some(menu))
+        .map_err(|error| format!("failed to update tray menu: {error}"))?;
+    tray.set_tooltip(Some(labels.tooltip))
+        .map_err(|error| format!("failed to update tray tooltip: {error}"))?;
+    Ok(())
+}
+
+fn emit_tray_panel_event<R: Runtime>(app: &AppHandle<R>, panel: &str) {
+    let _ = app.emit_to(MAIN_WINDOW_LABEL, TRAY_PANEL_EVENT, panel);
+}
+
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
         MENU_OPEN_ID => {
@@ -176,6 +277,18 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
         }
         MENU_HIDE_ID => {
             let _ = hide_main_window(app);
+        }
+        MENU_ADD_ACCOUNT_ID => {
+            let _ = show_main_window(app);
+            emit_tray_panel_event(app, "add");
+        }
+        MENU_STATUS_ID => {
+            let _ = show_main_window(app);
+            emit_tray_panel_event(app, "status");
+        }
+        MENU_SETTINGS_ID => {
+            let _ = show_main_window(app);
+            emit_tray_panel_event(app, "settings");
         }
         MENU_QUIT_ID => app.exit(0),
         _ => {}
@@ -209,7 +322,7 @@ fn handle_window_event<R: Runtime>(window: &tauri::Window<R>, event: &WindowEven
             set_sessions_tracking(true);
         }
         WindowEvent::Focused(false) => {
-            schedule_hide_after_blur(window.app_handle().clone(), window.label().to_string());
+            set_sessions_tracking(false);
         }
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
@@ -238,52 +351,6 @@ fn hide_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     set_sessions_tracking(false);
     window.hide()?;
     Ok(())
-}
-
-fn schedule_hide_after_blur<R: Runtime>(app: AppHandle<R>, label: String) {
-    thread::spawn(move || {
-        thread::sleep(WINDOW_HIDE_ON_BLUR_DELAY);
-
-        let Some(window) = app.get_webview_window(&label) else {
-            return;
-        };
-
-        if !window.is_visible().unwrap_or(false) {
-            return;
-        }
-
-        if window.is_focused().unwrap_or(false) {
-            set_sessions_tracking(true);
-            return;
-        }
-
-        if cursor_is_inside_window(&window) {
-            trace_refresh("blur-hide-skipped:pointer-inside");
-            return;
-        }
-
-        set_sessions_tracking(false);
-        let _ = window.hide();
-    });
-}
-
-fn cursor_is_inside_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> bool {
-    let Ok(cursor) = window.cursor_position() else {
-        return false;
-    };
-    let Ok(position) = window.outer_position() else {
-        return false;
-    };
-    let Ok(size) = window.outer_size() else {
-        return false;
-    };
-
-    let left = f64::from(position.x);
-    let top = f64::from(position.y);
-    let right = left + f64::from(size.width);
-    let bottom = top + f64::from(size.height);
-
-    cursor.x >= left && cursor.x <= right && cursor.y >= top && cursor.y <= bottom
 }
 
 fn position_main_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> tauri::Result<()> {

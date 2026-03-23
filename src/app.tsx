@@ -17,9 +17,9 @@ import {
   launchAddAccountLogin,
   manageAutoSwitchService,
   removeAccount,
+  setUiLanguage,
   switchAccount,
   updateSettings,
-  quitApp,
 } from "./lib/tauri";
 import type {
   AccountSummary,
@@ -31,6 +31,11 @@ import type {
 
 type PanelMode = "add" | "status" | "settings" | null;
 const STATE_INVALIDATED_EVENT = "codex://state-invalidated";
+const TRAY_PANEL_EVENT = "codex://tray-panel";
+const MIN_WINDOW_WIDTH = 360;
+const MIN_WINDOW_HEIGHT = 420;
+const WINDOW_HORIZONTAL_MARGIN = 18;
+const WINDOW_VERTICAL_MARGIN = 18;
 
 export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
@@ -49,6 +54,8 @@ export function App() {
   const [serviceActionMessage, setServiceActionMessage] = useState<string | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<SettingsUpdate | null>(null);
   const queuedRefreshTimer = useRef<number | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const resizeFrameRef = useRef<number | null>(null);
 
   const [lang, setLang] = useState<Lang>("zh");
   const t = (en: string, zh: string) => lang === "zh" ? zh : en;
@@ -56,6 +63,12 @@ export function App() {
   useEffect(() => {
     void refresh(true);
   }, []);
+
+  useEffect(() => {
+    void setUiLanguage(lang).catch((syncError) => {
+      setError(String(syncError));
+    });
+  }, [lang]);
 
   useEffect(() => {
     let disposed = false;
@@ -84,14 +97,32 @@ export function App() {
         const detachInvalidate = await currentWindow.listen<string>(STATE_INVALIDATED_EVENT, () => {
           queueRefresh();
         });
+        const detachTrayPanel = await currentWindow.listen<string>(TRAY_PANEL_EVENT, ({ payload }) => {
+          if (payload === "add") {
+            setLoginLaunchMessage(null);
+            setPanelMode("add");
+            return;
+          }
+
+          if (payload === "status") {
+            setPanelMode("status");
+            return;
+          }
+
+          if (payload === "settings") {
+            setServiceActionMessage(null);
+            setPanelMode("settings");
+          }
+        });
 
         if (disposed) {
           void detachFocus();
           void detachInvalidate();
+          void detachTrayPanel();
           return;
         }
 
-        unlisteners.push(detachFocus, detachInvalidate);
+        unlisteners.push(detachFocus, detachInvalidate, detachTrayPanel);
       } catch {
         // Browser preview and non-Tauri runtimes do not expose window events.
       }
@@ -110,6 +141,186 @@ export function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+
+    function measureElementOuterHeight(element: HTMLElement): number {
+      const style = window.getComputedStyle(element);
+      const marginTop = Number.parseFloat(style.marginTop || "0");
+      const marginBottom = Number.parseFloat(style.marginBottom || "0");
+      return Math.ceil(element.getBoundingClientRect().height + marginTop + marginBottom);
+    }
+
+    function measureScrollContentHeight(container: HTMLElement): number {
+      const style = window.getComputedStyle(container);
+      const paddingTop = Number.parseFloat(style.paddingTop || "0");
+      const paddingBottom = Number.parseFloat(style.paddingBottom || "0");
+      const borderTop = Number.parseFloat(style.borderTopWidth || "0");
+      const borderBottom = Number.parseFloat(style.borderBottomWidth || "0");
+      let contentBottom = 0;
+
+      for (const child of Array.from(container.children)) {
+        if (!(child instanceof HTMLElement)) {
+          continue;
+        }
+
+        const childStyle = window.getComputedStyle(child);
+        const marginBottom = Number.parseFloat(childStyle.marginBottom || "0");
+        contentBottom = Math.max(
+          contentBottom,
+          child.offsetTop + child.offsetHeight + marginBottom,
+        );
+      }
+
+      return Math.ceil(borderTop + paddingTop + contentBottom + paddingBottom + borderBottom);
+    }
+
+    function measurePanelNaturalHeight(panel: HTMLElement): number {
+      const style = window.getComputedStyle(panel);
+      const paddingTop = Number.parseFloat(style.paddingTop || "0");
+      const paddingBottom = Number.parseFloat(style.paddingBottom || "0");
+      const borderTop = Number.parseFloat(style.borderTopWidth || "0");
+      const borderBottom = Number.parseFloat(style.borderBottomWidth || "0");
+      let contentHeight = 0;
+
+      for (const child of Array.from(panel.children)) {
+        if (!(child instanceof HTMLElement)) {
+          continue;
+        }
+
+        if (child.classList.contains("panel-scroll")) {
+          contentHeight += measureScrollContentHeight(child);
+          continue;
+        }
+
+        contentHeight += measureElementOuterHeight(child);
+      }
+
+      return Math.ceil(borderTop + paddingTop + contentHeight + paddingBottom + borderBottom);
+    }
+
+    function scheduleResize() {
+      if (resizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(resizeFrameRef.current);
+      }
+      resizeFrameRef.current = window.requestAnimationFrame(() => {
+        resizeFrameRef.current = null;
+        void fitWindowHeightToContent();
+      });
+    }
+
+    async function fitWindowHeightToContent() {
+      if (disposed || !panelRef.current) {
+        return;
+      }
+
+      const panel = panelRef.current;
+      const panelScroll = panel.querySelector<HTMLElement>(".panel-scroll");
+      const panelRect = panel.getBoundingClientRect();
+      const panelHeight = measurePanelNaturalHeight(panel);
+      const hiddenOverflowWidth = panelScroll
+        ? Math.max(0, panelScroll.scrollWidth - panelScroll.clientWidth)
+        : 0;
+      const panelWidth = Math.ceil(panelRect.width + hiddenOverflowWidth);
+      const appShell = panelRef.current.closest(".app-shell");
+      const shellStyle = appShell ? window.getComputedStyle(appShell) : null;
+      const shellPaddingLeft = shellStyle ? Number.parseFloat(shellStyle.paddingLeft || "0") : 10;
+      const shellPaddingRight = shellStyle ? Number.parseFloat(shellStyle.paddingRight || "0") : 10;
+      const shellPaddingTop = shellStyle ? Number.parseFloat(shellStyle.paddingTop || "0") : 10;
+      const shellPaddingBottom = shellStyle ? Number.parseFloat(shellStyle.paddingBottom || "0") : 10;
+      const desiredWidth = Math.ceil(panelWidth + shellPaddingLeft + shellPaddingRight);
+      const desiredHeight = Math.ceil(panelHeight + shellPaddingTop + shellPaddingBottom);
+
+      try {
+        const { getCurrentWindow, LogicalSize, currentMonitor } = await import("@tauri-apps/api/window");
+        const currentWindow = getCurrentWindow();
+        const [innerSize, scaleFactor, monitor] = await Promise.all([
+          currentWindow.innerSize(),
+          currentWindow.scaleFactor(),
+          currentMonitor(),
+        ]);
+
+        const currentLogicalWidth = innerSize.width / scaleFactor;
+        const currentLogicalHeight = innerSize.height / scaleFactor;
+        const monitorLogicalWidth = monitor
+          ? monitor.workArea.size.width / monitor.scaleFactor
+          : window.screen.availWidth;
+        const monitorLogicalHeight = monitor
+          ? monitor.workArea.size.height / monitor.scaleFactor
+          : window.screen.availHeight;
+        const maxAllowedWidth = Math.max(
+          MIN_WINDOW_WIDTH,
+          Math.floor(monitorLogicalWidth - WINDOW_HORIZONTAL_MARGIN * 2),
+        );
+        const maxAllowedHeight = Math.max(
+          MIN_WINDOW_HEIGHT,
+          Math.floor(monitorLogicalHeight - WINDOW_VERTICAL_MARGIN * 2),
+        );
+        const nextWidth = Math.max(
+          MIN_WINDOW_WIDTH,
+          Math.min(maxAllowedWidth, desiredWidth),
+        );
+        const nextHeight = Math.max(
+          MIN_WINDOW_HEIGHT,
+          Math.min(maxAllowedHeight, desiredHeight),
+        );
+
+        if (
+          Math.abs(currentLogicalWidth - nextWidth) < 1
+          && Math.abs(currentLogicalHeight - nextHeight) < 1
+        ) {
+          return;
+        }
+
+        await currentWindow.setSize(new LogicalSize(nextWidth, nextHeight));
+      } catch {
+        // Browser preview and non-Tauri runtimes do not expose window sizing APIs.
+      }
+    }
+
+    scheduleResize();
+
+    const observer = new ResizeObserver(() => {
+      scheduleResize();
+    });
+    const mutationObserver = new MutationObserver(() => {
+      scheduleResize();
+    });
+    if (panelRef.current) {
+      observer.observe(panelRef.current);
+      mutationObserver.observe(panelRef.current, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+    }
+    window.addEventListener("resize", scheduleResize);
+
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      mutationObserver.disconnect();
+      window.removeEventListener("resize", scheduleResize);
+      if (resizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(resizeFrameRef.current);
+        resizeFrameRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (panelMode !== "settings" || !snapshot || settingsDraft) {
+      return;
+    }
+
+    setSettingsDraft({
+      autoSwitchEnabled: snapshot.autoSwitch.enabled,
+      threshold5hPercent: snapshot.autoSwitch.threshold5hPercent,
+      thresholdWeeklyPercent: snapshot.autoSwitch.thresholdWeeklyPercent,
+      apiUsageEnabled: snapshot.apiUsageEnabled,
+    });
+  }, [panelMode, settingsDraft, snapshot]);
 
   async function refresh(initial = false) {
     if (initial) {
@@ -163,26 +374,6 @@ export function App() {
     } finally {
       setRemovingKey(null);
     }
-  }
-
-  function openSettingsPanel() {
-    if (!snapshot) {
-      return;
-    }
-
-    setServiceActionMessage(null);
-    setSettingsDraft({
-      autoSwitchEnabled: snapshot.autoSwitch.enabled,
-      threshold5hPercent: snapshot.autoSwitch.threshold5hPercent,
-      thresholdWeeklyPercent: snapshot.autoSwitch.thresholdWeeklyPercent,
-      apiUsageEnabled: snapshot.apiUsageEnabled,
-    });
-    setPanelMode("settings");
-  }
-
-  function openAddAccountPanel() {
-    setLoginLaunchMessage(null);
-    setPanelMode("add");
   }
 
   async function handleSaveSettings() {
@@ -252,7 +443,7 @@ export function App() {
 
   return (
     <main className="app-shell">
-      <section className="panel">
+      <section className="panel" ref={panelRef}>
         <div className="panel-anchor" aria-hidden="true" data-tauri-drag-region />
         <header className="topbar">
           <div className="topbar-copy" data-tauri-drag-region>
@@ -262,20 +453,32 @@ export function App() {
           <div className="topbar-actions">
             <button
               type="button"
-              className="icon-button icon-button-wide"
+              className="v2-top-icon-btn v2-top-text-btn"
               onClick={() => setLang(lang === "zh" ? "en" : "zh")}
               aria-label={t("Switch language", "切换语言")}
+              title={t("Switch language", "切换语言")}
             >
               {lang === "zh" ? "EN" : "中"}
             </button>
             <button
               type="button"
-              className="icon-button"
+              className="v2-top-icon-btn"
+              onClick={() => setShowEmails((value) => !value)}
+              aria-label={showEmails ? t("Hide Emails", "隐藏完整邮箱") : t("Show Emails", "显示完整邮箱")}
+              aria-pressed={showEmails}
+              title={showEmails ? t("Hide Emails", "隐藏完整邮箱") : t("Show Emails", "显示完整邮箱")}
+            >
+              {showEmails ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg> : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>}
+            </button>
+            <button
+              type="button"
+              className="v2-top-icon-btn"
               onClick={() => void refresh()}
               disabled={isRefreshing || isLoading}
               aria-label={t("Refresh snapshot", "刷新快照")}
+              title={t("Refresh snapshot", "刷新快照")}
             >
-              {isRefreshing ? "..." : "R"}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3" /></svg>
             </button>
           </div>
         </header>
@@ -294,17 +497,8 @@ export function App() {
           ) : (
             <>
               <header className="v2-topbar">
-                <div className="v2-top-row">
-                  <h1 className="v2-title">Codex</h1>
-                  <div className="v2-top-right">
-                    {current ? <span className="v2-current-email">{maskEmail(current.email, showEmails)}</span> : <span className="v2-current-email">{t("No active account", "无激活用量")}</span>}
-                    <button type="button" className="v2-refresh-btn" onClick={() => void refresh()} disabled={isRefreshing || isLoading} aria-label="Refresh">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3" /></svg>
-                    </button>
-                  </div>
-                </div>
                 <div className="v2-sub-row">
-                  <span className="v2-updated">{formatUpdatedAt(snapshot.lastUpdatedAt, lang)}</span>
+                  {current ? <span className="v2-current-email">{maskEmail(current.email, showEmails)}</span> : <span className="v2-current-email">{t("No active account", "无激活用量")}</span>}
                   <div className="v2-sub-actions">
                     {current ? <span className="v2-plan">{formatPlan(current.plan)}</span> : <span className="v2-plan" />}
                     {current ? (
@@ -346,13 +540,16 @@ export function App() {
                         <span className={`plan-mini ${planTone(account.plan)}`}>{formatPlan(account.plan)}</span>
                       </div>
                       <div className="v2-acc-bottom">
-                        <span className="v2-mini-lbl">5h</span>
-                        <div className="v2-mini-meter"><div className="v2-fill" style={{ width: `${account.usage5h?.remainingPercent ?? 0}%` }} /></div>
-                        <span className="v2-mini-val">{formatPercent(account.usage5h?.remainingPercent)}</span>
-
-                        <span className="v2-mini-lbl v2-spacer">wk</span>
-                        <div className="v2-mini-meter"><div className="v2-fill" style={{ width: `${account.usageWeekly?.remainingPercent ?? 0}%` }} /></div>
-                        <span className="v2-mini-val">{formatPercent(account.usageWeekly?.remainingPercent)}</span>
+                        <div className="account-usage-item">
+                          <span className="v2-mini-lbl">5h</span>
+                          <div className="v2-mini-meter"><div className="v2-fill" style={{ width: `${account.usage5h?.remainingPercent ?? 0}%` }} /></div>
+                          <span className="v2-mini-val">{formatPercent(account.usage5h?.remainingPercent)}</span>
+                        </div>
+                        <div className="account-usage-item">
+                          <span className="v2-mini-lbl">wk</span>
+                          <div className="v2-mini-meter"><div className="v2-fill" style={{ width: `${account.usageWeekly?.remainingPercent ?? 0}%` }} /></div>
+                          <span className="v2-mini-val">{formatPercent(account.usageWeekly?.remainingPercent)}</span>
+                        </div>
                       </div>
                       <div className="account-row-actions">
                         <button
@@ -377,35 +574,6 @@ export function App() {
                 )}
               </section>
 
-              <div className="v2-divider" />
-
-              <section className="v2-actions">
-                <ActionButton
-                  icon={<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>}
-                  label={t("Add Account", "添加账号")}
-                  onClick={openAddAccountPanel}
-                />
-                <ActionButton
-                  icon={<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2A10 10 0 0 0 2 12a10 10 0 0 0 10 10 10 10 0 0 0 10-10A10 10 0 0 0 12 2Z"></path><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>}
-                  label={t("Status Page", "查看状态详情")}
-                  onClick={() => setPanelMode("status")}
-                />
-                <ActionButton
-                  icon={showEmails ? <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg> : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>}
-                  label={showEmails ? t("Hide Emails", "隐藏完整邮箱") : t("Show Emails", "显示完整邮箱")}
-                  onClick={() => setShowEmails((value) => !value)}
-                />
-                <ActionButton
-                  icon={<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>}
-                  label={t("Settings", "偏好设置")}
-                  onClick={openSettingsPanel}
-                />
-                <ActionButton
-                  icon={<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>}
-                  label={t("Quit", "退出应用")}
-                  onClick={() => { void quitApp() }}
-                />
-              </section>
             </>
           )}
         </div>
@@ -670,25 +838,6 @@ function UsageSection({
       </div>
       <p className="v2-usage-sub">{formatResetLabel(window, lang)}</p>
     </section>
-  );
-}
-
-function ActionButton({
-  icon,
-  label,
-  onClick,
-  disabled,
-}: {
-  icon?: ReactNode;
-  label: string;
-  onClick?: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button type="button" className="v2-action-row" onClick={onClick} disabled={disabled}>
-      {icon && <span className="v2-action-icon">{icon}</span>}
-      <span className="v2-action-label">{label}</span>
-    </button>
   );
 }
 

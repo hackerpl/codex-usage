@@ -297,6 +297,33 @@ pub fn switch_account(account_key: String) -> Result<AppSnapshot, String> {
     ))
 }
 
+pub fn remove_account(account_key: String) -> Result<AppSnapshot, String> {
+    let codex_home = resolve_codex_home()?;
+    let mut warnings = Vec::new();
+    let (registry_path, active_auth_path, accounts_dir, mut registry) =
+        load_and_sync_registry(&codex_home, &mut warnings)?;
+
+    remove_account_from_registry(
+        &codex_home,
+        &registry_path,
+        &active_auth_path,
+        &accounts_dir,
+        &mut registry,
+        &account_key,
+        &mut warnings,
+    )?;
+
+    Ok(build_snapshot(
+        &codex_home,
+        &registry_path,
+        &active_auth_path,
+        &accounts_dir,
+        registry_path.exists(),
+        registry,
+        warnings,
+    ))
+}
+
 pub fn update_settings(input: SettingsUpdate) -> Result<AppSnapshot, String> {
     validate_threshold(input.threshold_5h_percent, "5h threshold")?;
     validate_threshold(input.threshold_weekly_percent, "weekly threshold")?;
@@ -825,6 +852,72 @@ fn switch_account_in_registry(
     } else {
         let _ = refresh_active_usage_from_sessions(codex_home, registry, warnings)?;
     }
+    sort_accounts_by_email_key(&mut registry.accounts);
+    save_registry(registry_path, registry)?;
+    Ok(())
+}
+
+fn remove_account_from_registry(
+    codex_home: &Path,
+    registry_path: &Path,
+    active_auth_path: &Path,
+    accounts_dir: &Path,
+    registry: &mut RegistryFile,
+    account_key: &str,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if registry.accounts.is_empty() {
+        return Err("No accounts are tracked in registry.json.".to_string());
+    }
+
+    let target_index = registry
+        .accounts
+        .iter()
+        .position(|record| record.account_key == account_key)
+        .ok_or_else(|| format!("Account not found: {account_key}"))?;
+    let was_active = registry.active_account_key.as_deref() == Some(account_key);
+
+    if was_active && registry.accounts.len() > 1 {
+        let next_index = pick_best_account_index(
+            &registry.accounts,
+            Some(target_index),
+            now_unix_seconds(),
+            |_| true,
+        )
+        .ok_or_else(|| "Failed to choose a replacement account.".to_string())?;
+        let next_key = registry.accounts[next_index].account_key.clone();
+        switch_account_in_registry(
+            codex_home,
+            registry_path,
+            active_auth_path,
+            accounts_dir,
+            registry,
+            &next_key,
+            warnings,
+        )?;
+    }
+
+    let snapshot_name = account_snapshot_file_name(account_key);
+    remove_file_with_backup_if_exists(
+        &account_auth_path(codex_home, account_key),
+        accounts_dir,
+        &snapshot_name,
+    )?;
+
+    let initial_len = registry.accounts.len();
+    registry
+        .accounts
+        .retain(|record| record.account_key != account_key);
+    if registry.accounts.len() == initial_len {
+        return Err(format!("Account not found: {account_key}"));
+    }
+
+    if registry.accounts.is_empty() {
+        registry.active_account_key = None;
+        registry.active_account_activated_at_ms = None;
+        remove_file_with_backup_if_exists(active_auth_path, accounts_dir, "auth.json")?;
+    }
+
     sort_accounts_by_email_key(&mut registry.accounts);
     save_registry(registry_path, registry)?;
     Ok(())
@@ -1915,6 +2008,24 @@ fn backup_auth_if_changed(
         .map_err(|error| format!("Failed to write auth backup: {error}"))?;
     prune_backups(accounts_dir, "auth.json")?;
     Ok(())
+}
+
+fn remove_file_with_backup_if_exists(
+    path: &Path,
+    backup_dir: &Path,
+    base_name: &str,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let bytes =
+        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let backup_path = make_backup_path(backup_dir, base_name)?;
+    fs::write(&backup_path, bytes)
+        .map_err(|error| format!("Failed to write backup {}: {error}", backup_path.display()))?;
+    prune_backups(backup_dir, base_name)?;
+    fs::remove_file(path).map_err(|error| format!("Failed to remove {}: {error}", path.display()))
 }
 
 fn make_backup_path(dir: &Path, base_name: &str) -> Result<PathBuf, String> {

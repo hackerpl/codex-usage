@@ -48,6 +48,17 @@ export async function switchAccount(accountKey: string): Promise<AppSnapshot> {
   }
 }
 
+export async function removeAccount(accountKey: string): Promise<AppSnapshot> {
+  try {
+    return await invokeCommand<AppSnapshot>("remove_account", { accountKey });
+  } catch (error) {
+    if (!isPreviewRuntimeError(error)) {
+      throw error;
+    }
+    return withFallback(`Remove is unavailable in browser preview for ${accountKey}.`);
+  }
+}
+
 export async function updateSettings(input: SettingsUpdate): Promise<AppSnapshot> {
   try {
     return await invokeCommand<AppSnapshot>("update_settings", { input });

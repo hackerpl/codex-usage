@@ -53,6 +53,11 @@ fn switch_account(account_key: String) -> Result<codex::AppSnapshot, String> {
 }
 
 #[tauri::command]
+fn remove_account(account_key: String) -> Result<codex::AppSnapshot, String> {
+    codex::remove_account(account_key)
+}
+
+#[tauri::command]
 fn update_settings(input: codex::SettingsUpdate) -> Result<codex::AppSnapshot, String> {
     codex::update_settings(input)
 }
@@ -124,6 +129,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
             switch_account,
+            remove_account,
             update_settings,
             launch_add_account_login,
             manage_auto_switch_service,

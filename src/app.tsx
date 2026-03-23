@@ -16,6 +16,7 @@ import {
   getAppSnapshot,
   launchAddAccountLogin,
   manageAutoSwitchService,
+  removeAccount,
   switchAccount,
   updateSettings,
 } from "./lib/tauri";
@@ -37,7 +38,9 @@ export function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [switchingKey, setSwitchingKey] = useState<string | null>(null);
+  const [removingKey, setRemovingKey] = useState<string | null>(null);
   const [panelMode, setPanelMode] = useState<PanelMode>(null);
+  const [pendingRemoval, setPendingRemoval] = useState<AccountSummary | null>(null);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isLaunchingLogin, setIsLaunchingLogin] = useState(false);
   const [isRunningServiceAction, setIsRunningServiceAction] = useState(false);
@@ -144,6 +147,23 @@ export function App() {
     }
   }
 
+  async function handleRemoveAccount(account: AccountSummary) {
+    setRemovingKey(account.accountKey);
+
+    try {
+      const next = await removeAccount(account.accountKey);
+      startTransition(() => {
+        setSnapshot(next);
+        setError(null);
+      });
+      setPendingRemoval(null);
+    } catch (removeError) {
+      setError(String(removeError));
+    } finally {
+      setRemovingKey(null);
+    }
+  }
+
   function openSettingsPanel() {
     if (!snapshot) {
       return;
@@ -222,6 +242,12 @@ export function App() {
 
   const current = snapshot?.currentAccount ?? null;
   const accountCount = (snapshot?.otherAccounts.length ?? 0) + (current ? 1 : 0);
+  const pendingRemovalIsCurrent = pendingRemoval?.isActive ?? false;
+  const pendingRemovalWillClearActiveAuth = accountCount <= 1;
+
+  function isAccountBusy(accountKey: string): boolean {
+    return switchingKey === accountKey || removingKey === accountKey;
+  }
 
   return (
     <main className="app-shell">
@@ -232,15 +258,25 @@ export function App() {
             <h1>Codex</h1>
             <p>{snapshot ? formatUpdatedAt(snapshot.lastUpdatedAt, lang) : t("Loading local state...", "正在载入本地状态...")}</p>
           </div>
-          <button
-            type="button"
-            className="icon-button"
-            onClick={() => void refresh()}
-            disabled={isRefreshing || isLoading}
-            aria-label="Refresh snapshot"
-          >
-            {isRefreshing ? "..." : "R"}
-          </button>
+          <div className="topbar-actions">
+            <button
+              type="button"
+              className="icon-button icon-button-wide"
+              onClick={() => setLang(lang === "zh" ? "en" : "zh")}
+              aria-label={t("Switch language", "切换语言")}
+            >
+              {lang === "zh" ? "EN" : "中"}
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => void refresh()}
+              disabled={isRefreshing || isLoading}
+              aria-label={t("Refresh snapshot", "刷新快照")}
+            >
+              {isRefreshing ? "..." : "R"}
+            </button>
+          </div>
         </header>
         <div className="panel-scroll">
           {error ? <div className="banner banner-error">{error}</div> : null}
@@ -266,9 +302,21 @@ export function App() {
                       {current ? current.accountKey : snapshot.registryPath}
                     </div>
                   </div>
-                  {current ? (
-                    <span className={`plan-pill ${planTone(current.plan)}`}>{formatPlan(current.plan)}</span>
-                  ) : null}
+                  <div className="hero-header-actions">
+                    {current ? (
+                      <span className={`plan-pill ${planTone(current.plan)}`}>{formatPlan(current.plan)}</span>
+                    ) : null}
+                    {current ? (
+                      <button
+                        type="button"
+                        className="row-action-button row-action-button-danger"
+                        onClick={() => setPendingRemoval(current)}
+                        disabled={isAccountBusy(current.accountKey)}
+                      >
+                        {removingKey === current.accountKey ? t("Removing...", "移除中...") : t("Remove", "移除")}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
 
                 <UsageSection title={t("5 Hours", "近5小时用量")} window={current?.usage5h ?? null} lang={lang} />
@@ -277,20 +325,14 @@ export function App() {
 
               <section className="account-list">
                 <div className="section-title">
-                  <span>{t("Switch Account", "切换账号")}</span>
+                  <span>{t("Other Accounts", "其他账号")}</span>
                   <span className="section-meta">{accountCount} {t("tracked", "个账号")}</span>
                 </div>
                 {snapshot.otherAccounts.length === 0 ? (
-                  <div className="empty-inline">{t("No alternate accounts in the registry yet.", "登记簿中暂无可以切换的其他账号。")}</div>
+                  <div className="empty-inline">{t("No other accounts in the registry yet.", "登记簿中暂无其他账号。")}</div>
                 ) : (
                   snapshot.otherAccounts.map((account) => (
-                    <button
-                      type="button"
-                      key={account.accountKey}
-                      className="account-row"
-                      onClick={() => void handleSwitch(account)}
-                      disabled={switchingKey === account.accountKey}
-                    >
+                    <div key={account.accountKey} className="account-row">
                       <div className="account-row-head">
                         <span>{maskEmail(account.email, showEmails)}</span>
                         <span className={`plan-mini ${planTone(account.plan)}`}>{formatPlan(account.plan)}</span>
@@ -299,7 +341,25 @@ export function App() {
                         <MiniUsage label="5h" window={account.usage5h} />
                         <MiniUsage label="wk" window={account.usageWeekly} />
                       </div>
-                    </button>
+                      <div className="account-row-actions">
+                        <button
+                          type="button"
+                          className="row-action-button"
+                          onClick={() => void handleSwitch(account)}
+                          disabled={isAccountBusy(account.accountKey)}
+                        >
+                          {switchingKey === account.accountKey ? t("Switching...", "切换中...") : t("Switch", "切换")}
+                        </button>
+                        <button
+                          type="button"
+                          className="row-action-button row-action-button-danger"
+                          onClick={() => setPendingRemoval(account)}
+                          disabled={isAccountBusy(account.accountKey)}
+                        >
+                          {removingKey === account.accountKey ? t("Removing...", "移除中...") : t("Remove", "移除")}
+                        </button>
+                      </div>
+                    </div>
                   ))
                 )}
               </section>
@@ -324,11 +384,6 @@ export function App() {
                   label={t("Settings", "偏好设置")}
                   detail={t(`Auto switch ${snapshot.autoSwitch.enabled ? "on" : "off"}`, `自动切换开关：${snapshot.autoSwitch.enabled ? "开" : "关"}`)}
                   onClick={openSettingsPanel}
-                />
-                <ActionButton
-                  label={t("Switch Language", "语言 / Language (CN)")}
-                  detail={t("切换至中文体验", "Switch UI to English")}
-                  onClick={() => setLang(lang === "zh" ? "en" : "zh")}
                 />
               </section>
             </>
@@ -395,6 +450,57 @@ export function App() {
             <a href="https://status.openai.com" target="_blank" rel="noreferrer">
               https://status.openai.com
             </a>
+          </div>
+        </Modal>
+      ) : null}
+
+      {pendingRemoval ? (
+        <Modal
+          title={t("Remove Account", "移除账号")}
+          onClose={() => {
+            if (!removingKey) {
+              setPendingRemoval(null);
+            }
+          }}
+        >
+          <p className="modal-copy">
+            {pendingRemovalWillClearActiveAuth
+              ? t(
+                "This will remove the last tracked account and clear the active local auth snapshot.",
+                "这会移除最后一个已登记账号，并清空当前本地激活认证快照。"
+              )
+              : pendingRemovalIsCurrent
+                ? t(
+                  "This will remove the current account and immediately switch the app to the healthiest remaining account.",
+                  "这会移除当前账号，并立即切换到剩余账号里状态最好的一个。"
+                )
+                : t(
+                  "This will delete the selected account from the local registry and remove its saved auth snapshot.",
+                  "这会把所选账号从本地登记簿删除，并移除它保存的认证快照。"
+                )}
+          </p>
+          <div className="status-grid modal-confirm-grid">
+            <StatusRow label={t("Account", "账号")} value={maskEmail(pendingRemoval.email, showEmails)} />
+            <StatusRow label={t("Plan", "套餐")} value={formatPlan(pendingRemoval.plan)} />
+            <StatusRow label={t("Account Key", "账号键")} value={pendingRemoval.accountKey} multiline />
+          </div>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setPendingRemoval(null)}
+              disabled={Boolean(removingKey)}
+            >
+              {t("Cancel", "取消")}
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => void handleRemoveAccount(pendingRemoval)}
+              disabled={Boolean(removingKey)}
+            >
+              {removingKey === pendingRemoval.accountKey ? t("Removing...", "移除中...") : t("Remove Account", "确认移除")}
+            </button>
           </div>
         </Modal>
       ) : null}
